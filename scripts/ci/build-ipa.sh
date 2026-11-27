@@ -20,6 +20,21 @@ deps)
   dependencies/build-ios-zstd.sh
   ;;
 runtime)
+  mkdir -p .build/kernel/artifacts
+  curl -fL -o /tmp/android-kernel.tar.gz \
+    https://github.com/imxieyi/Kernarium/releases/download/andarium-1.1/android-6.18-arm64-4k-20261119-6.18.60-ca1.tar.gz
+  tar xzf /tmp/android-kernel.tar.gz -C .build/kernel/artifacts
+  rm -rf .build/kernel/artifacts/mainline-6.18-arm64-4k-20261119-6.18.60-ca1
+  cp -R .build/kernel/artifacts/android-6.18-arm64-4k-20261119-6.18.60-ca1 \
+    .build/kernel/artifacts/mainline-6.18-arm64-4k-20261119-6.18.60-ca1
+  python3 - <<'PYEOF'
+import json
+p='.build/kernel/artifacts/mainline-6.18-arm64-4k-20261119-6.18.60-ca1/kernel-artifact.json'
+d=json.load(open(p))
+d['family']='mainline-6.18'
+d['directory_name']='mainline-6.18-arm64-4k-20261119-6.18.60-ca1'
+json.dump(d,open(p,'w'),indent=2)
+PYEOF
   cmake --preset kernarium-ios-device
   cmake --build --preset kernarium-ios-device
   cmake --preset kernarium-ios-device-android
