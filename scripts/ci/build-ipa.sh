@@ -8,7 +8,7 @@ case "$stage" in
 starter)
   sudo apt-get update
   sudo apt-get install -y build-essential bison flex gettext libncurses-dev libssl-dev \
-    bc cpio rsync file wget curl unzip python3 git perl tar gzip bzip2 xz-utils
+    bc cpio rsync file wget curl unzip python3 git perl tar gzip bzip2 xz-utils debootstrap gdisk e2fsprogs
   rm -rf /tmp/starter-work /tmp/starter-release
   tools/rootfs/starter/build-all.sh --work /tmp/starter-work --output /tmp/starter-release --product boot-base-aarch64
   mkdir -p .build/starter
