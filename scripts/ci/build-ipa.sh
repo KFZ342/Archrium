@@ -85,7 +85,14 @@ app)
   if [ -z "${ARCHRIUM_ROOTFS:-}" ]; then
     mkdir -p .build/rootfs-parts
     rm -f .build/rootfs-parts/archrium.erofs.part.*
-    gh release download rootfs-v1       -R "${GITHUB_REPOSITORY:-KFZ342/Archrium}"       -p 'archrium.erofs.part.*' -D .build/rootfs-parts
+    if ! gh release download rootfs-v1 \
+      -R "${GITHUB_REPOSITORY:-KFZ342/Archrium}" \
+      -p 'archrium.erofs.part.*' -D .build/rootfs-parts; then
+      for part in 0 1; do
+        curl -fL --retry 3 -o ".build/rootfs-parts/archrium.erofs.part.$part" \
+          "https://github.com/KFZ342/Archrium/releases/download/rootfs-v1/archrium.erofs.part.$part"
+      done
+    fi
     cat .build/rootfs-parts/archrium.erofs.part.* > .build/archrium.erofs
     ARCHRIUM_ROOTFS=.build/archrium.erofs
   fi
