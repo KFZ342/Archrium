@@ -1,0 +1,162 @@
+name: Build Archrium IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Kernarium/**'
+      - 'GuestHost/**'
+      - 'dependencies/**'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - '.github/workflows/build-ipa.yml'
+
+concurrency:
+  group: archrium-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependencies:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+          cmake --version
+
+      - name: Prepare and build macOS dependencies
+        run: |
+          set -eux
+          dependencies/prepare.sh --product macos
+          dependencies/build.sh
+
+      - name: Prepare and build Apple GPU dependencies
+        run: |
+          set -eux
+          dependencies/prepare.sh --product apple-gpu-vulkan-experiment
+          dependencies/build-apple-gpu.sh --platform ios
+
+      - name: Prepare and build iOS network dependencies
+        run: |
+          set -eux
+          dependencies/prepare.sh --product ios-network
+          dependencies/build-ios-network.sh --platform ios
+
+      - name: Prepare and build iOS storage dependencies
+        run: |
+          set -eux
+          dependencies/prepare.sh --product ios-storage
+          dependencies/build-ios-storage.sh
+
+      - name: Prepare and build iOS compression dependencies
+        run: |
+          set -eux
+          dependencies/prepare.sh --product ios-compression
+          dependencies/build-ios-zstd.sh
+
+      - name: Upload dependency prefixes
+        uses: actions/upload-artifact@v4
+        with:
+          name: archrium-dependencies
+          path: .build/dependencies
+          if-no-files-found: error
+          retention-days: 7
+
+  runtime:
+    needs: dependencies
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+          cmake --version
+
+      - name: Download dependency prefixes
+        uses: actions/download-artifact@v4
+        with:
+          name: archrium-dependencies
+          path: .build/dependencies
+
+      - name: Build Linux runtime
+        run: |
+          set -eux
+          cmake --preset kernarium-ios-device
+          cmake --build --preset kernarium-ios-device
+
+      - name: Build Android runtime
+        run: |
+          set -eux
+          cmake --preset kernarium-ios-device-android
+          cmake --build --preset kernarium-ios-device-android
+
+      - name: Package iOS frameworks
+        run: |
+          set -eux
+          chmod +x Kernarium/scripts/package-ios-frameworks.sh
+          Kernarium/scripts/package-ios-frameworks.sh --sdk device
+
+      - name: Upload frameworks
+        uses: actions/upload-artifact@v4
+        with:
+          name: archrium-frameworks
+          path: .build/kernarium-xcframeworks
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: runtime
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Download frameworks
+        uses: actions/download-artifact@v4
+        with:
+          name: archrium-frameworks
+          path: .build/kernarium-xcframeworks
+
+      - name: Build unsigned app
+        run: |
+          set -eux
+          xcodebuild \
+            -project Kernarium/Kernarium.xcodeproj \
+            -scheme Kernarium \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64 \
+            -derivedDataPath .build/DerivedData \
+            build
+
+      - name: Package IPA
+        run: |
+          set -eux
+          APP=$(find .build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP" || { echo "No app built" >&2; exit 1; }
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Archrium-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Archrium-unsigned-ipa
+          path: Archrium-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
