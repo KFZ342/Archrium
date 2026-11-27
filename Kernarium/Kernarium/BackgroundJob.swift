@@ -117,26 +117,28 @@ struct SystemBackgroundJobScheduler: BackgroundJobScheduling {
             subtitle: subtitle
         )
         request.strategy = .fail
-        guard #available(iOS 27.0, *) else {
-            // Before iOS 27 the request is submitted on the calling thread and
-            // a refusal is thrown at once.
-            do {
-                try BGTaskScheduler.shared.submit(request)
-            } catch {
-                refused(error)
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
+        if #available(iOS 27.0, *) {
+            // iOS 27 submits off the calling thread and reports later, possibly
+            // after it has already started the task.
+            nonisolated(unsafe) let handed = request
+            DispatchQueue.global(qos: .userInitiated).async {
+                BGTaskScheduler.shared.submitTaskRequest(handed) { error in
+                    guard let error else { return }
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { refused(error) }
+                    }
+                }
             }
             return
         }
-        // iOS 27 submits off the calling thread and reports later, possibly
-        // after it has already started the task.
-        nonisolated(unsafe) let handed = request
-        DispatchQueue.global(qos: .userInitiated).async {
-            BGTaskScheduler.shared.submitTaskRequest(handed) { error in
-                guard let error else { return }
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated { refused(error) }
-                }
-            }
+#endif
+        // Before iOS 27 the request is submitted on the calling thread and
+        // a refusal is thrown at once.
+        do {
+            try BGTaskScheduler.shared.submit(request)
+        } catch {
+            refused(error)
         }
     }
 

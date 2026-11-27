@@ -117,6 +117,7 @@ private final class RendererFeed: PictureInPictureFeed {
 /// iOS 27: the frames go through the receiver of a render synchronizer that
 /// runs on the host clock, so a frame stamped with the time it is made is due
 /// as it arrives, and each enqueue reports its outcome.
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
 @available(iOS 27.0, *)
 @MainActor
 private final class ReceiverFeed: PictureInPictureFeed {
@@ -158,6 +159,7 @@ private final class ReceiverFeed: PictureInPictureFeed {
         Task { await receiver.flush(removingDisplayedImage: true) }
     }
 }
+#endif
 
 private let runtimeFrameSink: kernarium_runtime_frame_sink = { context, buffer in
     guard let context, let buffer else { return }
@@ -304,9 +306,12 @@ final class GuestPictureInPicture: NSObject, PictureInPictureWindow {
         guard pictureInPicture == nil else { return }
         configureAudioSession()
         if feed == nil {
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
             if #available(iOS 27.0, *) {
                 feed = ReceiverFeed(layer: layer)
-            } else {
+            } else
+#endif
+            {
                 feed = RendererFeed(layer: layer)
             }
         }

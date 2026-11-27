@@ -763,13 +763,11 @@ final class TextGuestMetalView: GuestMetalView, UIKeyInput {
     private lazy var keyboardlessInputView = UIView(frame: .zero)
 
     override var inputView: UIView? {
-        get { softwareKeyboardVisible ? super.inputView : keyboardlessInputView }
-        set { super.inputView = newValue }
+        softwareKeyboardVisible ? super.inputView : keyboardlessInputView
     }
 
     override var inputAccessoryView: UIView? {
-        get { softwareKeyboardVisible ? super.inputAccessoryView : nil }
-        set { super.inputAccessoryView = newValue }
+        softwareKeyboardVisible ? super.inputAccessoryView : nil
     }
 
     override func setKeyboardVisible(_ visible: Bool) {
