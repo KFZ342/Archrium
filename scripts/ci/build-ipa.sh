@@ -82,6 +82,13 @@ app)
     build
   APP=$(find .build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
   test -n "$APP"
+  if [ -z "${ARCHRIUM_ROOTFS:-}" ]; then
+    mkdir -p .build/rootfs-parts
+    rm -f .build/rootfs-parts/archrium.erofs.part.*
+    gh release download rootfs-v1       -R "${GITHUB_REPOSITORY:-KFZ342/Archrium}"       -p 'archrium.erofs.part.*' -D .build/rootfs-parts
+    cat .build/rootfs-parts/archrium.erofs.part.* > .build/archrium.erofs
+    ARCHRIUM_ROOTFS=.build/archrium.erofs
+  fi
   if [ -n "${ARCHRIUM_ROOTFS:-}" ]; then
     test -f "$ARCHRIUM_ROOTFS"
     cp "$ARCHRIUM_ROOTFS" "$APP/archrium.erofs"
