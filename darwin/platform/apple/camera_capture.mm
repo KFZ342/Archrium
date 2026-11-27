@@ -59,6 +59,7 @@ std::string stringOf(NSString* value)
 }
 
 #if TARGET_OS_IOS
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 // What a connection says of its angle and mirroring (camera_presentation.hpp): its own by default, and as it is now.
 struct ConnectionFacts {
     std::int16_t defaultAngle {-1};
