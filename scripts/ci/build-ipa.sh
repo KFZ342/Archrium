@@ -95,7 +95,7 @@ app)
   fi
   mkdir -p Payload
   cp -R "$APP" Payload/
-  zip -qry Archrium-unsigned.ipa Payload
+  zip -0 -qr Archrium-unsigned.ipa Payload
   ;;
 *)
   echo "unknown stage: $stage" >&2
