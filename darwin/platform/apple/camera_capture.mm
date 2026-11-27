@@ -58,6 +58,11 @@ std::string stringOf(NSString* value)
     return value ? std::string(value.UTF8String) : std::string();
 }
 
+#if __IPHONE_OS_VERSION_MAX_ALLOWED < 270000
+static NSString* const AVCaptureDeviceTypeBuiltInOuterUltraWideCamera = AVCaptureDeviceTypeBuiltInUltraWideCamera;
+static NSString* const AVCaptureDeviceTypeBuiltInInnerUltraWideCamera = AVCaptureDeviceTypeBuiltInUltraWideCamera;
+#endif
+
 #if TARGET_OS_IOS
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 // What a connection says of its angle and mirroring (camera_presentation.hpp): its own by default, and as it is now.
