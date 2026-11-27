@@ -421,11 +421,11 @@ enum RootfsImage {
     /// The image the application ships in its own bundle, released into
     /// Documents on first launch so the guest can be started without the
     /// user moving a multi-gigabyte file by hand.
-    static var bundledImageURL: URL? {
+    nonisolated static var bundledImageURL: URL? {
         Bundle.main.url(forResource: "archrium", withExtension: "erofs")
     }
 
-    static var needsBundledImage: Bool {
+    nonisolated static var needsBundledImage: Bool {
         guard let bundledImageURL else { return false }
         return !FileManager.default.fileExists(
             atPath: documentsDirectory
@@ -437,7 +437,7 @@ enum RootfsImage {
     /// Copies the bundled image beside the guest disks, through a temporary
     /// name so an interrupted first launch never leaves a short image that
     /// the settings would offer as bootable.
-    static func installBundledImageIfNeeded() throws {
+    nonisolated static func installBundledImageIfNeeded() throws {
         guard needsBundledImage, let bundledImageURL else { return }
         let fileManager = FileManager.default
         let destination = documentsDirectory
