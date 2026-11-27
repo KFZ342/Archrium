@@ -32,8 +32,18 @@ deps)
   ;;
 runtime)
   mkdir -p .build/rootfs/starter-20260928-boot-base-r1
-  cp .build/starter/uml-boot-base-aarch64.cpio.gz \
-    .build/rootfs/starter-20260928-boot-base-r1/uml-boot-base-aarch64.cpio.gz
+  BASE=.build/rootfs/starter-20260928-boot-base-r1/uml-boot-base-aarch64.cpio.gz
+  cp .build/starter/uml-boot-base-aarch64.cpio.gz "$BASE"
+  # Replace /init in the base archive with the persistent-overlay version.
+  # A later newc entry with the same name replaces the earlier one during
+  # kernel unpack, so the base itself does not have to be unpacked.
+  rm -rf /tmp/init-override
+  mkdir -p /tmp/init-override
+  cp tools/rootfs/boot-ramdisk/init /tmp/init-override/init
+  ( cd /tmp/init-override && printf 'init\n' | cpio -o -H newc ) > /tmp/init-override.cpio
+  gunzip -c "$BASE" > /tmp/boot-base.cpio
+  cat /tmp/boot-base.cpio /tmp/init-override.cpio | gzip -9 > /tmp/boot-base-new.cpio.gz
+  mv /tmp/boot-base-new.cpio.gz "$BASE"
   python3 - <<'PYEOF'
 import hashlib, os
 p='tools/rootfs/boot-ramdisk/accepted-aarch64.env'

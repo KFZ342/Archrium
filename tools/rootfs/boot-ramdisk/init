@@ -185,9 +185,20 @@ mount_overlay_root()
 		;;
 	ext4)
 		wait_for_device "$upper_device"
-		mkfs.ext4 -F -q -m 0 \
-			-E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
-			"$upper_device" || fail "cannot format $upper_device"
+		# A persistent overlay keeps the guest's writes across runs. Only a
+		# device without an ext4 signature is formatted; every later boot
+		# checks and reuses it.
+		case "$(blkid "$upper_device" 2>/dev/null)" in
+		*TYPE=\"ext4\"*)
+			e2fsck -p "$upper_device" || :
+			resize2fs "$upper_device" >/dev/null 2>&1 || :
+			;;
+		*)
+			mkfs.ext4 -F -q -m 0 \
+				-E nodiscard,lazy_itable_init=1,lazy_journal_init=1 \
+				"$upper_device" || fail "cannot format $upper_device"
+			;;
+		esac
 		mount -t ext4 -o noatime,nosuid,nodev "$upper_device" /state || \
 			fail "cannot mount $upper_device"
 		;;

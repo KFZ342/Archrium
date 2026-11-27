@@ -780,15 +780,22 @@ enum OverlayDisk {
         return UInt64(sizeGiB) * 1024 * 1024 * 1024
     }
 
-    static func recreate(
+    static func prepare(
         sizeGiB: Int,
-        in directory: URL = FileManager.default.temporaryDirectory
+        in directory: URL = RootfsImage.documentsDirectory
     ) throws -> URL {
         let manager = FileManager.default
         let disk = directory.appendingPathComponent(filename)
         let requestedByteCount = try byteCount(forSizeGiB: sizeGiB)
         if manager.fileExists(atPath: disk.path) {
-            try manager.removeItem(at: disk)
+            let attributes = try manager.attributesOfItem(atPath: disk.path)
+            let current = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+            if current < requestedByteCount {
+                let handle = try FileHandle(forWritingTo: disk)
+                defer { try? handle.close() }
+                try handle.truncate(atOffset: requestedByteCount)
+            }
+            return disk
         }
         guard manager.createFile(atPath: disk.path, contents: nil) else {
             throw CocoaError(.fileWriteUnknown)
@@ -801,6 +808,10 @@ enum OverlayDisk {
             try? manager.removeItem(at: disk)
             throw error
         }
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutable = disk
+        try? mutable.setResourceValues(values)
         return disk
     }
 }
@@ -1217,7 +1228,7 @@ final class EmulatorLauncher: ObservableObject, SpaceRun {
             }
         }
         do {
-            let overlay = try OverlayDisk.recreate(
+            let overlay = try OverlayDisk.prepare(
                 sizeGiB: configuration.overlaySizeGiB
             )
             return PreparedBoot(rootfs: rootfs, overlay: overlay)
