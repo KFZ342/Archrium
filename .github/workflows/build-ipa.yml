@@ -1,0 +1,58 @@
+name: Build Archrium IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Check source
+        run: |
+          test -d Kernarium/Kernarium.xcodeproj || {
+            echo "Kernarium source is not in this repository yet." >&2
+            exit 1
+          }
+
+      - name: Package iOS frameworks
+        run: |
+          chmod +x Kernarium/scripts/package-ios-frameworks.sh
+          Kernarium/scripts/package-ios-frameworks.sh --sdk device
+
+      - name: Build unsigned app
+        run: |
+          xcodebuild \
+            -project Kernarium/Kernarium.xcodeproj \
+            -scheme Kernarium \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64 \
+            -derivedDataPath .build/DerivedData \
+            build
+
+      - name: Package IPA
+        run: |
+          APP=$(find .build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP" || { echo "No app built" >&2; exit 1; }
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry Archrium-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Archrium-unsigned-ipa
+          path: Archrium-unsigned.ipa
+          if-no-files-found: error
