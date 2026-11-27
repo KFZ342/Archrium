@@ -267,20 +267,24 @@ struct Output final {
 [[nodiscard]] bool connectPlayer(AVAudioEngine* engine,
     AVAudioPlayerNode* player, AVAudioFormat* format, NSError** error)
 {
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
     if (@available(iOS 27.0, *)) {
         return [engine connect:player
                             to:engine.mainMixerNode
                         format:format
                          error:error];
     }
+#endif
     [engine connect:player to:engine.mainMixerNode format:format];
     return true;
 }
 
 [[nodiscard]] bool startPlayer(AVAudioPlayerNode* player, NSError** error)
 {
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
     if (@available(iOS 27.0, *))
         return [player playAndReturnError:error];
+#endif
     // `play` reports nothing, and it returns with the player stopped when its
     // engine stopped between the engine's start and this call, as a change of
     // the format or the route does. What counts is that the player plays.
@@ -409,6 +413,7 @@ public:
                       if (const auto flags = weakNotifications.lock())
                           flags->signal(flags->configurationChanged);
                     }];
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
         if (@available(iOS 27.0, *)) {
             /* iOS 27 replaces the interruption notification with two: the
              * session becoming inactive, which also reports the app's own
