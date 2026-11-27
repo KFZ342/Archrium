@@ -1,0 +1,1114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Yi Xie <imxieyi@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 08:00:36 +0900
+Subject: [PATCH] venus: bound a host image copy by its footprint
+
+vkCopyImageToMemoryMESA points the driver straight at the reply blob so the
+temporary allocation and copy are skipped, and vkCopyMemoryToImageMESA
+points it at the command data the guest sent.  Both are as long as the guest
+chose, while the driver reaches as far as the copy region's footprint, so a
+guest that sizes either too small lets the driver write or read past
+renderer memory.
+
+Compute that footprint as Vulkan addresses memory for buffer-image copies:
+from the region, the image's format and array layer count, which the
+renderer now records when the image is created, and the texel block of that
+format and aspect as the Vulkan registry's format table gives it.  A format
+or aspect the table cannot state exactly is sized at 32 bytes a texel, more
+than any format holds, and a MEMCPY copy also counts the driver's memcpy
+size for its layers.  A region whose footprint fits the guest's memory is
+copied in place.  Otherwise the driver gets renderer memory of the whole
+footprint, zeroed for an upload, and only the bytes the guest allocated or
+sent move between it and the guest.  A region whose footprint cannot be
+stated, because its layers lie outside the image or its size overflows, is
+refused.
+
+The region is also held to the image and to what the guest sent.  The
+driver indexes the image's own tables by the region's mip level, aspect and
+extent and checks none of them, so a region must name a mip level the image
+has (its level count is recorded with its format), one aspect its format has,
+and an extent that lies inside that level.  And the footprint may exceed
+the guest's memory only by the 32 bytes a texel the table assumes for a
+format it cannot state, since the guest sized its memory for the region it
+copies: a row length or image height chosen freely cannot ask the renderer
+for memory the guest never accounted for.
+
+The same bounds hold for the other host image commands.  The readback stages
+its footprint in memory the renderer allocated, and the driver writes the
+texels of a padded row and leaves the padding between them, so the staging
+starts zeroed: the reply must not carry what the allocator last held.  A
+chroma plane (the second and third plane of a multi-planar format) is as
+large as its subsampling leaves it, half the image across and down in a 4:2:0
+format and half across in 4:2:2, rounded down and halved per mip level to one
+texel as the driver lays the plane out, and a region is held to that: an image
+whose extent the subsampling does not divide has fewer texels in the plane
+than the rounded-up quotient, so the driver would reach past its texture and,
+in an image-to-image copy, past its temporary.  And
+vkCopyImageToImage, which the driver copies through one temporary the size of
+the source plane, refuses a null image, a region outside either image, layers
+that differ between the two sides, and a destination that takes more bytes
+than the source gave, with VK_ERROR_OUT_OF_HOST_MEMORY as the memory copies
+do.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/venus/vkr_host_copy.c | 953 ++++++++++++++++++++++++++++++++++++--
+ src/venus/vkr_image.c     |  10 +-
+ src/venus/vkr_image.h     |   4 +
+ 3 files changed, 935 insertions(+), 32 deletions(-)
+
+diff --git a/src/venus/vkr_host_copy.c b/src/venus/vkr_host_copy.c
+index 95c4ee7ec47973f219d103bf09e6ee47a978a276..a505fdfc06c97cd373db8a56789f686c61b18bcc 100644
+--- a/src/venus/vkr_host_copy.c
++++ b/src/venus/vkr_host_copy.c
+@@ -5,47 +5,883 @@
+ 
+ #include "vkr_host_copy.h"
+ 
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
+ #include "vn_protocol_renderer_host_copy.h"
+ 
+ #include "vkr_context.h"
+ #include "vkr_device.h"
++#include "vkr_image.h"
+ 
+ static void
+-vkr_dispatch_vkCopyImageToImage(UNUSED struct vn_dispatch_context *dispatch,
+-                                struct vn_command_vkCopyImageToImage *args)
++vkr_dispatch_vkTransitionImageLayout(UNUSED struct vn_dispatch_context *dispatch,
++                                     struct vn_command_vkTransitionImageLayout *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+-   vn_replace_vkCopyImageToImage_args_handle(args);
+-   args->ret = vk->CopyImageToImage(args->device, args->pCopyImageToImageInfo);
++   vn_replace_vkTransitionImageLayout_args_handle(args);
++   args->ret =
++      vk->TransitionImageLayout(args->device, args->transitionCount, args->pTransitions);
++}
++
++/* One texel block of a format: its dimensions in texels and its size in
++ * bytes. */
++struct vkr_texel_block {
++   uint8_t width;
++   uint8_t height;
++   uint8_t depth;
++   uint8_t size;
++};
++
++/* The two tables below restate the format table of the Vulkan registry
++ * (vk.xml), which Vulkan-Hpp's vulkan_format_traits.hpp also carries.  A
++ * format either lacks is sized conservatively by vkr_host_copy_block(). */
++static bool
++vkr_format_texel_block(VkFormat format, struct vkr_texel_block *block)
++{
++   switch (format) {
++   case VK_FORMAT_R4G4_UNORM_PACK8:
++   case VK_FORMAT_A8_UNORM:
++   case VK_FORMAT_R8_UNORM:
++   case VK_FORMAT_R8_SNORM:
++   case VK_FORMAT_R8_USCALED:
++   case VK_FORMAT_R8_SSCALED:
++   case VK_FORMAT_R8_UINT:
++   case VK_FORMAT_R8_SINT:
++   case VK_FORMAT_R8_SRGB:
++   case VK_FORMAT_S8_UINT:
++   case VK_FORMAT_R8_BOOL_ARM:
++   case VK_FORMAT_R8_SFLOAT_FPENCODING_FLOAT8E4M3_ARM:
++   case VK_FORMAT_R8_SFLOAT_FPENCODING_FLOAT8E5M2_ARM:
++      *block = (struct vkr_texel_block){1, 1, 1, 1};
++      return true;
++   case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
++   case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
++   case VK_FORMAT_R5G6B5_UNORM_PACK16:
++   case VK_FORMAT_B5G6R5_UNORM_PACK16:
++   case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
++   case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
++   case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
++   case VK_FORMAT_A1B5G5R5_UNORM_PACK16:
++   case VK_FORMAT_R8G8_UNORM:
++   case VK_FORMAT_R8G8_SNORM:
++   case VK_FORMAT_R8G8_USCALED:
++   case VK_FORMAT_R8G8_SSCALED:
++   case VK_FORMAT_R8G8_UINT:
++   case VK_FORMAT_R8G8_SINT:
++   case VK_FORMAT_R8G8_SRGB:
++   case VK_FORMAT_R16_UNORM:
++   case VK_FORMAT_R16_SNORM:
++   case VK_FORMAT_R16_USCALED:
++   case VK_FORMAT_R16_SSCALED:
++   case VK_FORMAT_R16_UINT:
++   case VK_FORMAT_R16_SINT:
++   case VK_FORMAT_R16_SFLOAT:
++   case VK_FORMAT_D16_UNORM:
++   case VK_FORMAT_R10X6_UNORM_PACK16:
++   case VK_FORMAT_R12X4_UNORM_PACK16:
++   case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
++   case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
++   case VK_FORMAT_R10X6_UINT_PACK16_ARM:
++   case VK_FORMAT_R12X4_UINT_PACK16_ARM:
++   case VK_FORMAT_R14X2_UINT_PACK16_ARM:
++   case VK_FORMAT_R14X2_UNORM_PACK16_ARM:
++   case VK_FORMAT_R16_SFLOAT_FPENCODING_BFLOAT16_ARM:
++      *block = (struct vkr_texel_block){1, 1, 1, 2};
++      return true;
++   case VK_FORMAT_R8G8B8_UNORM:
++   case VK_FORMAT_R8G8B8_SNORM:
++   case VK_FORMAT_R8G8B8_USCALED:
++   case VK_FORMAT_R8G8B8_SSCALED:
++   case VK_FORMAT_R8G8B8_UINT:
++   case VK_FORMAT_R8G8B8_SINT:
++   case VK_FORMAT_R8G8B8_SRGB:
++   case VK_FORMAT_B8G8R8_UNORM:
++   case VK_FORMAT_B8G8R8_SNORM:
++   case VK_FORMAT_B8G8R8_USCALED:
++   case VK_FORMAT_B8G8R8_SSCALED:
++   case VK_FORMAT_B8G8R8_UINT:
++   case VK_FORMAT_B8G8R8_SINT:
++   case VK_FORMAT_B8G8R8_SRGB:
++   case VK_FORMAT_D16_UNORM_S8_UINT:
++      *block = (struct vkr_texel_block){1, 1, 1, 3};
++      return true;
++   case VK_FORMAT_R8G8B8A8_UNORM:
++   case VK_FORMAT_R8G8B8A8_SNORM:
++   case VK_FORMAT_R8G8B8A8_USCALED:
++   case VK_FORMAT_R8G8B8A8_SSCALED:
++   case VK_FORMAT_R8G8B8A8_UINT:
++   case VK_FORMAT_R8G8B8A8_SINT:
++   case VK_FORMAT_R8G8B8A8_SRGB:
++   case VK_FORMAT_B8G8R8A8_UNORM:
++   case VK_FORMAT_B8G8R8A8_SNORM:
++   case VK_FORMAT_B8G8R8A8_USCALED:
++   case VK_FORMAT_B8G8R8A8_SSCALED:
++   case VK_FORMAT_B8G8R8A8_UINT:
++   case VK_FORMAT_B8G8R8A8_SINT:
++   case VK_FORMAT_B8G8R8A8_SRGB:
++   case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
++   case VK_FORMAT_A8B8G8R8_SNORM_PACK32:
++   case VK_FORMAT_A8B8G8R8_USCALED_PACK32:
++   case VK_FORMAT_A8B8G8R8_SSCALED_PACK32:
++   case VK_FORMAT_A8B8G8R8_UINT_PACK32:
++   case VK_FORMAT_A8B8G8R8_SINT_PACK32:
++   case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
++   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++   case VK_FORMAT_A2R10G10B10_SNORM_PACK32:
++   case VK_FORMAT_A2R10G10B10_USCALED_PACK32:
++   case VK_FORMAT_A2R10G10B10_SSCALED_PACK32:
++   case VK_FORMAT_A2R10G10B10_UINT_PACK32:
++   case VK_FORMAT_A2R10G10B10_SINT_PACK32:
++   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++   case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
++   case VK_FORMAT_A2B10G10R10_USCALED_PACK32:
++   case VK_FORMAT_A2B10G10R10_SSCALED_PACK32:
++   case VK_FORMAT_A2B10G10R10_UINT_PACK32:
++   case VK_FORMAT_A2B10G10R10_SINT_PACK32:
++   case VK_FORMAT_R16G16_UNORM:
++   case VK_FORMAT_R16G16_SNORM:
++   case VK_FORMAT_R16G16_USCALED:
++   case VK_FORMAT_R16G16_SSCALED:
++   case VK_FORMAT_R16G16_UINT:
++   case VK_FORMAT_R16G16_SINT:
++   case VK_FORMAT_R16G16_SFLOAT:
++   case VK_FORMAT_R32_UINT:
++   case VK_FORMAT_R32_SINT:
++   case VK_FORMAT_R32_SFLOAT:
++   case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
++   case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
++   case VK_FORMAT_X8_D24_UNORM_PACK32:
++   case VK_FORMAT_D32_SFLOAT:
++   case VK_FORMAT_D24_UNORM_S8_UINT:
++   case VK_FORMAT_R10X6G10X6_UNORM_2PACK16:
++   case VK_FORMAT_R12X4G12X4_UNORM_2PACK16:
++   case VK_FORMAT_R16G16_SFIXED5_NV:
++   case VK_FORMAT_R10X6G10X6_UINT_2PACK16_ARM:
++   case VK_FORMAT_R12X4G12X4_UINT_2PACK16_ARM:
++   case VK_FORMAT_R14X2G14X2_UINT_2PACK16_ARM:
++   case VK_FORMAT_R14X2G14X2_UNORM_2PACK16_ARM:
++      *block = (struct vkr_texel_block){1, 1, 1, 4};
++      return true;
++   case VK_FORMAT_R16G16B16_UNORM:
++   case VK_FORMAT_R16G16B16_SNORM:
++   case VK_FORMAT_R16G16B16_USCALED:
++   case VK_FORMAT_R16G16B16_SSCALED:
++   case VK_FORMAT_R16G16B16_UINT:
++   case VK_FORMAT_R16G16B16_SINT:
++   case VK_FORMAT_R16G16B16_SFLOAT:
++      *block = (struct vkr_texel_block){1, 1, 1, 6};
++      return true;
++   case VK_FORMAT_R16G16B16A16_UNORM:
++   case VK_FORMAT_R16G16B16A16_SNORM:
++   case VK_FORMAT_R16G16B16A16_USCALED:
++   case VK_FORMAT_R16G16B16A16_SSCALED:
++   case VK_FORMAT_R16G16B16A16_UINT:
++   case VK_FORMAT_R16G16B16A16_SINT:
++   case VK_FORMAT_R16G16B16A16_SFLOAT:
++   case VK_FORMAT_R32G32_UINT:
++   case VK_FORMAT_R32G32_SINT:
++   case VK_FORMAT_R32G32_SFLOAT:
++   case VK_FORMAT_R64_UINT:
++   case VK_FORMAT_R64_SINT:
++   case VK_FORMAT_R64_SFLOAT:
++   case VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16:
++   case VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16:
++   case VK_FORMAT_R10X6G10X6B10X6A10X6_UINT_4PACK16_ARM:
++   case VK_FORMAT_R12X4G12X4B12X4A12X4_UINT_4PACK16_ARM:
++   case VK_FORMAT_R14X2G14X2B14X2A14X2_UINT_4PACK16_ARM:
++   case VK_FORMAT_R14X2G14X2B14X2A14X2_UNORM_4PACK16_ARM:
++      *block = (struct vkr_texel_block){1, 1, 1, 8};
++      return true;
++   case VK_FORMAT_R32G32B32_UINT:
++   case VK_FORMAT_R32G32B32_SINT:
++   case VK_FORMAT_R32G32B32_SFLOAT:
++      *block = (struct vkr_texel_block){1, 1, 1, 12};
++      return true;
++   case VK_FORMAT_R32G32B32A32_UINT:
++   case VK_FORMAT_R32G32B32A32_SINT:
++   case VK_FORMAT_R32G32B32A32_SFLOAT:
++   case VK_FORMAT_R64G64_UINT:
++   case VK_FORMAT_R64G64_SINT:
++   case VK_FORMAT_R64G64_SFLOAT:
++      *block = (struct vkr_texel_block){1, 1, 1, 16};
++      return true;
++   case VK_FORMAT_R64G64B64_UINT:
++   case VK_FORMAT_R64G64B64_SINT:
++   case VK_FORMAT_R64G64B64_SFLOAT:
++      *block = (struct vkr_texel_block){1, 1, 1, 24};
++      return true;
++   case VK_FORMAT_R64G64B64A64_UINT:
++   case VK_FORMAT_R64G64B64A64_SINT:
++   case VK_FORMAT_R64G64B64A64_SFLOAT:
++      *block = (struct vkr_texel_block){1, 1, 1, 32};
++      return true;
++   case VK_FORMAT_D32_SFLOAT_S8_UINT:
++      *block = (struct vkr_texel_block){1, 1, 1, 5};
++      return true;
++   case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
++   case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
++   case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
++   case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
++   case VK_FORMAT_BC4_UNORM_BLOCK:
++   case VK_FORMAT_BC4_SNORM_BLOCK:
++   case VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK:
++   case VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK:
++   case VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK:
++   case VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK:
++   case VK_FORMAT_EAC_R11_UNORM_BLOCK:
++   case VK_FORMAT_EAC_R11_SNORM_BLOCK:
++   case VK_FORMAT_PVRTC1_4BPP_UNORM_BLOCK_IMG:
++   case VK_FORMAT_PVRTC2_4BPP_UNORM_BLOCK_IMG:
++   case VK_FORMAT_PVRTC1_4BPP_SRGB_BLOCK_IMG:
++   case VK_FORMAT_PVRTC2_4BPP_SRGB_BLOCK_IMG:
++      *block = (struct vkr_texel_block){4, 4, 1, 8};
++      return true;
++   case VK_FORMAT_BC2_UNORM_BLOCK:
++   case VK_FORMAT_BC2_SRGB_BLOCK:
++   case VK_FORMAT_BC3_UNORM_BLOCK:
++   case VK_FORMAT_BC3_SRGB_BLOCK:
++   case VK_FORMAT_BC5_UNORM_BLOCK:
++   case VK_FORMAT_BC5_SNORM_BLOCK:
++   case VK_FORMAT_BC6H_UFLOAT_BLOCK:
++   case VK_FORMAT_BC6H_SFLOAT_BLOCK:
++   case VK_FORMAT_BC7_UNORM_BLOCK:
++   case VK_FORMAT_BC7_SRGB_BLOCK:
++   case VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK:
++   case VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK:
++   case VK_FORMAT_EAC_R11G11_UNORM_BLOCK:
++   case VK_FORMAT_EAC_R11G11_SNORM_BLOCK:
++   case VK_FORMAT_ASTC_4x4_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_4x4_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){4, 4, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_5x4_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_5x4_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_5x4_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){5, 4, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_5x5_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_5x5_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_5x5_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){5, 5, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_6x5_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_6x5_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_6x5_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){6, 5, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_6x6_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_6x6_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_6x6_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){6, 6, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_8x5_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_8x5_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_8x5_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){8, 5, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_8x6_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_8x6_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_8x6_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){8, 6, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_8x8_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_8x8_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_8x8_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){8, 8, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_10x5_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_10x5_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_10x5_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){10, 5, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_10x6_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_10x6_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_10x6_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){10, 6, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_10x8_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_10x8_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_10x8_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){10, 8, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_10x10_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_10x10_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_10x10_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){10, 10, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_12x10_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_12x10_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_12x10_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){12, 10, 1, 16};
++      return true;
++   case VK_FORMAT_ASTC_12x12_UNORM_BLOCK:
++   case VK_FORMAT_ASTC_12x12_SRGB_BLOCK:
++   case VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK:
++      *block = (struct vkr_texel_block){12, 12, 1, 16};
++      return true;
++   case VK_FORMAT_G8B8G8R8_422_UNORM:
++   case VK_FORMAT_B8G8R8G8_422_UNORM:
++      *block = (struct vkr_texel_block){2, 1, 1, 4};
++      return true;
++   case VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16:
++   case VK_FORMAT_B10X6G10X6R10X6G10X6_422_UNORM_4PACK16:
++   case VK_FORMAT_G12X4B12X4G12X4R12X4_422_UNORM_4PACK16:
++   case VK_FORMAT_B12X4G12X4R12X4G12X4_422_UNORM_4PACK16:
++   case VK_FORMAT_G16B16G16R16_422_UNORM:
++   case VK_FORMAT_B16G16R16G16_422_UNORM:
++      *block = (struct vkr_texel_block){2, 1, 1, 8};
++      return true;
++   case VK_FORMAT_PVRTC1_2BPP_UNORM_BLOCK_IMG:
++   case VK_FORMAT_PVRTC2_2BPP_UNORM_BLOCK_IMG:
++   case VK_FORMAT_PVRTC1_2BPP_SRGB_BLOCK_IMG:
++   case VK_FORMAT_PVRTC2_2BPP_SRGB_BLOCK_IMG:
++      *block = (struct vkr_texel_block){8, 4, 1, 8};
++      return true;
++   case VK_FORMAT_ASTC_3x3x3_UNORM_BLOCK_EXT:
++   case VK_FORMAT_ASTC_3x3x3_SRGB_BLOCK_EXT:
++   case VK_FORMAT_ASTC_3x3x3_SFLOAT_BLOCK_EXT:
++      *block = (struct vkr_texel_block){3, 3, 3, 16};
++      return true;
++   case VK_FORMAT_ASTC_4x3x3_UNORM_BLOCK_EXT:
++   case VK_FORMAT_ASTC_4x3x3_SRGB_BLOCK_EXT:
++   case VK_FORMAT_ASTC_4x3x3_SFLOAT_BLOCK_EXT:
++      *block = (struct vkr_texel_block){4, 3, 3, 16};
++      return true;
++   case VK_FORMAT_ASTC_4x4x3_UNORM_BLOCK_EXT:
++   case VK_FORMAT_ASTC_4x4x3_SRGB_BLOCK_EXT:
++   case VK_FORMAT_ASTC_4x4x3_SFLOAT_BLOCK_EXT:
++      *block = (struct vkr_texel_block){4, 4, 3, 16};
++      return true;
++   case VK_FORMAT_ASTC_4x4x4_UNORM_BLOCK_EXT:
++   case VK_FORMAT_ASTC_4x4x4_SRGB_BLOCK_EXT:
++   case VK_FORMAT_ASTC_4x4x4_SFLOAT_BLOCK_EXT:
++      *block = (struct vkr_texel_block){4, 4, 4, 16};
++      return true;
++   case VK_FORMAT_ASTC_5x4x4_UNORM_BLOCK_EXT:
++   case VK_FORMAT_ASTC_5x4x4_SRGB_BLOCK_EXT:
++   case VK_FORMAT_ASTC_5x4x4_SFLOAT_BLOCK_EXT:
++      *block = (struct vkr_texel_block){5, 4, 4, 16};
++      return true;
++   case VK_FORMAT_ASTC_5x5x4_UNORM_BLOCK_EXT:
++   case VK_FORMAT_ASTC_5x5x4_SRGB_BLOCK_EXT:
++   case VK_FORMAT_ASTC_5x5x4_SFLOAT_BLOCK_EXT:
++      *block = (struct vkr_texel_block){5, 5, 4, 16};
++      return true;
++   case VK_FORMAT_ASTC_5x5x5_UNORM_BLOCK_EXT:
++   case VK_FORMAT_ASTC_5x5x5_SRGB_BLOCK_EXT:
++   case VK_FORMAT_ASTC_5x5x5_SFLOAT_BLOCK_EXT:
++      *block = (struct vkr_texel_block){5, 5, 5, 16};
++      return true;
++   case VK_FORMAT_ASTC_6x5x5_UNORM_BLOCK_EXT:
++   case VK_FORMAT_ASTC_6x5x5_SRGB_BLOCK_EXT:
++   case VK_FORMAT_ASTC_6x5x5_SFLOAT_BLOCK_EXT:
++      *block = (struct vkr_texel_block){6, 5, 5, 16};
++      return true;
++   case VK_FORMAT_ASTC_6x6x5_UNORM_BLOCK_EXT:
++   case VK_FORMAT_ASTC_6x6x5_SRGB_BLOCK_EXT:
++   case VK_FORMAT_ASTC_6x6x5_SFLOAT_BLOCK_EXT:
++      *block = (struct vkr_texel_block){6, 6, 5, 16};
++      return true;
++   case VK_FORMAT_ASTC_6x6x6_UNORM_BLOCK_EXT:
++   case VK_FORMAT_ASTC_6x6x6_SRGB_BLOCK_EXT:
++   case VK_FORMAT_ASTC_6x6x6_SFLOAT_BLOCK_EXT:
++      *block = (struct vkr_texel_block){6, 6, 6, 16};
++      return true;
++   default:
++      return false;
++   }
++}
++
++static uint32_t
++vkr_format_plane_size(VkFormat format, uint32_t plane)
++{
++   switch (format) {
++   case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
++   case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
++   case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
++      return plane < 3 ? (const uint8_t[]){1, 1, 1}[plane] : 0;
++   case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
++   case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
++   case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
++      return plane < 2 ? (const uint8_t[]){1, 2}[plane] : 0;
++   case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
++   case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
++   case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
++   case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
++   case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
++   case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
++   case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
++   case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
++   case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
++      return plane < 3 ? (const uint8_t[]){2, 2, 2}[plane] : 0;
++   case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
++   case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
++   case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
++   case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
++   case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
++   case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
++   case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
++   case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
++   case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
++   case VK_FORMAT_G14X2_B14X2R14X2_2PLANE_420_UNORM_3PACK16_ARM:
++   case VK_FORMAT_G14X2_B14X2R14X2_2PLANE_422_UNORM_3PACK16_ARM:
++      return plane < 2 ? (const uint8_t[]){2, 4}[plane] : 0;
++   default:
++      return 0;
++   }
+ }
+ 
++/* The block a host image copy moves for one aspect of an image's format.  A
++ * depth or stencil aspect copies as the Depth/Stencil Aspect Copy Table says
++ * and a plane as its compatible format, in the plane's own texels.  Anything
++ * else these tables cannot state exactly, such as a combined aspect, is sized
++ * at 32 bytes a texel, more than any format holds.
++ */
++#define VKR_HOST_COPY_MAX_BLOCK_SIZE 32
++
++static struct vkr_texel_block
++vkr_host_copy_block(VkFormat format, VkImageAspectFlags aspect)
++{
++   const struct vkr_texel_block unknown = { 1, 1, 1, VKR_HOST_COPY_MAX_BLOCK_SIZE };
++   bool depth_stencil = true;
++   uint32_t depth_size = 0;
++
++   switch (format) {
++   case VK_FORMAT_S8_UINT:
++      break;
++   case VK_FORMAT_D16_UNORM:
++   case VK_FORMAT_D16_UNORM_S8_UINT:
++      depth_size = 2;
++      break;
++   case VK_FORMAT_X8_D24_UNORM_PACK32:
++   case VK_FORMAT_D24_UNORM_S8_UINT:
++   case VK_FORMAT_D32_SFLOAT:
++   case VK_FORMAT_D32_SFLOAT_S8_UINT:
++      depth_size = 4;
++      break;
++   default:
++      depth_stencil = false;
++      break;
++   }
++
++   if (depth_stencil) {
++      if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT && format != VK_FORMAT_D16_UNORM &&
++          format != VK_FORMAT_X8_D24_UNORM_PACK32 && format != VK_FORMAT_D32_SFLOAT)
++         return (struct vkr_texel_block){ 1, 1, 1, 1 };
++      if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT && depth_size)
++         return (struct vkr_texel_block){ 1, 1, 1, depth_size };
++      return unknown;
++   }
++
++   uint32_t plane;
++   switch (aspect) {
++   case VK_IMAGE_ASPECT_PLANE_0_BIT:
++      plane = 0;
++      break;
++   case VK_IMAGE_ASPECT_PLANE_1_BIT:
++      plane = 1;
++      break;
++   case VK_IMAGE_ASPECT_PLANE_2_BIT:
++      plane = 2;
++      break;
++   case VK_IMAGE_ASPECT_COLOR_BIT: {
++      struct vkr_texel_block block;
++      return vkr_format_texel_block(format, &block) ? block : unknown;
++   }
++   default:
++      return unknown;
++   }
++
++   const uint32_t plane_size = vkr_format_plane_size(format, plane);
++   return plane_size ? (struct vkr_texel_block){ 1, 1, 1, plane_size } : unknown;
++}
++
++/* The aspects an image of this format has, or 0 for a format these tables
++ * cannot describe, whose aspects the driver alone can state. */
++static VkImageAspectFlags
++vkr_host_copy_format_aspects(VkFormat format)
++{
++   switch (format) {
++   case VK_FORMAT_S8_UINT:
++      return VK_IMAGE_ASPECT_STENCIL_BIT;
++   case VK_FORMAT_D16_UNORM:
++   case VK_FORMAT_X8_D24_UNORM_PACK32:
++   case VK_FORMAT_D32_SFLOAT:
++      return VK_IMAGE_ASPECT_DEPTH_BIT;
++   case VK_FORMAT_D16_UNORM_S8_UINT:
++   case VK_FORMAT_D24_UNORM_S8_UINT:
++   case VK_FORMAT_D32_SFLOAT_S8_UINT:
++      return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++   default:
++      break;
++   }
++
++   if (vkr_format_plane_size(format, 0)) {
++      return VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT |
++             (vkr_format_plane_size(format, 2) ? VK_IMAGE_ASPECT_PLANE_2_BIT : 0);
++   }
++
++   struct vkr_texel_block block;
++   return vkr_format_texel_block(format, &block) ? VK_IMAGE_ASPECT_COLOR_BIT : 0;
++}
++
++/* The subsampling of the chroma planes (planes 1 and 2) of a multi-planar
++ * format: how many texels of plane 0 one texel of them spans across and down.
++ * Every other plane of every other format spans one. */
+ static void
+-vkr_dispatch_vkTransitionImageLayout(UNUSED struct vn_dispatch_context *dispatch,
+-                                     struct vn_command_vkTransitionImageLayout *args)
++vkr_host_copy_chroma_subsampling(VkFormat format,
++                                 VkImageAspectFlags aspect,
++                                 uint32_t *across,
++                                 uint32_t *down)
++{
++   *across = 1;
++   *down = 1;
++   if (aspect != VK_IMAGE_ASPECT_PLANE_1_BIT && aspect != VK_IMAGE_ASPECT_PLANE_2_BIT)
++      return;
++
++   switch (format) {
++   case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
++   case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
++   case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
++   case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
++   case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
++   case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
++   case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
++   case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
++   case VK_FORMAT_G14X2_B14X2R14X2_2PLANE_420_UNORM_3PACK16_ARM:
++      *across = 2;
++      *down = 2;
++      break;
++   case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
++   case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
++   case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
++   case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
++   case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
++   case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
++   case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
++   case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
++   case VK_FORMAT_G14X2_B14X2R14X2_2PLANE_422_UNORM_3PACK16_ARM:
++      *across = 2;
++      break;
++   default:
++      break;
++   }
++}
++
++/* An extent of the plane a region names, at a mip level, as the driver lays it
++ * out: the image's extent divided by the plane's subsampling and rounded down,
++ * then halved per level down to one texel.  The driver sizes the plane that way
++ * (kk_image_layout_init(), u_minify()), so an image whose extent a chroma
++ * plane does not divide evenly has fewer texels than the rounded-up quotient. */
++static uint32_t
++vkr_host_copy_plane_extent(uint32_t extent, uint32_t subsampling, uint32_t level)
++{
++   return level < 32 ? MAX2((extent / subsampling) >> level, 1u) : 1u;
++}
++
++/* Whether a region of a host image copy lies in the image: in a mip level it
++ * has, in an aspect its format has, and within the extent that level has.  The
++ * driver reads the image's own tables by these numbers and never checks them. */
++static bool
++vkr_host_copy_region_is_in_image(const struct vkr_image *image,
++                                 const VkImageSubresourceLayers *subresource,
++                                 VkOffset3D offset,
++                                 VkExtent3D extent)
++{
++   if (subresource->mipLevel >= image->mip_levels) {
++      vkr_log("host image copy: mip level %u is past the image's %u levels",
++              subresource->mipLevel, image->mip_levels);
++      return false;
++   }
++
++   const VkImageAspectFlags aspect = subresource->aspectMask;
++   const VkImageAspectFlags aspects = vkr_host_copy_format_aspects(image->format);
++   if (!util_is_power_of_two_nonzero(aspect) || (aspects && (aspect & ~aspects))) {
++      vkr_log("host image copy: aspect 0x%x is not one aspect of the image", aspect);
++      return false;
++   }
++
++   /* The region is in the texels of the plane its aspect names. */
++   const uint32_t level = subresource->mipLevel;
++   uint32_t across, down;
++   vkr_host_copy_chroma_subsampling(image->format, aspect, &across, &down);
++   if (offset.x < 0 || offset.y < 0 || offset.z < 0 ||
++       (uint64_t)offset.x + extent.width >
++          vkr_host_copy_plane_extent(image->extent.width, across, level) ||
++       (uint64_t)offset.y + extent.height >
++          vkr_host_copy_plane_extent(image->extent.height, down, level) ||
++       (uint64_t)offset.z + extent.depth >
++          vkr_host_copy_plane_extent(image->extent.depth, 1, level)) {
++      vkr_log("host image copy: the region lies outside the image's extent at mip "
++              "level %u", level);
++      return false;
++   }
++
++   return true;
++}
++
++/* How many array layers a copy of these subresource layers reaches, or false
++ * when the layers lie outside the image. */
++static bool
++vkr_host_copy_layer_count(const struct vkr_image *image,
++                          const VkImageSubresourceLayers *subresource,
++                          uint32_t *count)
++{
++   if (subresource->baseArrayLayer >= image->array_layers)
++      return false;
++
++   const uint32_t available = image->array_layers - subresource->baseArrayLayer;
++   if (subresource->layerCount == VK_REMAINING_ARRAY_LAYERS) {
++      *count = available;
++      return true;
++   }
++   if (subresource->layerCount > available)
++      return false;
++   *count = subresource->layerCount;
++   return true;
++}
++
++/* The image side of a host image copy, with the device and image already
++ * replaced by the driver's handles. */
++struct vkr_host_copy_target {
++   struct vn_device_proc_table *vk;
++   VkDevice device;
++   const struct vkr_image *image;
++   VkImage handle;
++   VkHostImageCopyFlags flags;
++};
++
++/* The host memory one region of a host image copy reaches: the offset of its
++ * last texel block plus that block, addressed as Vulkan's buffer-image copies
++ * address memory.  With VK_HOST_IMAGE_COPY_MEMCPY_BIT the driver's own layout
++ * may reach further, so its memcpy size for the layers counts as well.  False
++ * when the region lies outside the image or its reach does not fit in size_t.
++ */
++static bool
++vkr_host_copy_footprint(const struct vkr_host_copy_target *target,
++                        const VkImageSubresourceLayers *subresource,
++                        uint32_t row_length,
++                        uint32_t image_height,
++                        VkOffset3D offset,
++                        VkExtent3D extent,
++                        size_t data_size,
++                        size_t *footprint)
++{
++   const struct vkr_image *image = target->image;
++   uint32_t layers;
++   if (!vkr_host_copy_layer_count(image, subresource, &layers) ||
++       !vkr_host_copy_region_is_in_image(image, subresource, offset, extent))
++      return false;
++
++   size_t reach = 0;
++   if (layers && extent.width && extent.height && extent.depth) {
++      const struct vkr_texel_block block =
++         vkr_host_copy_block(image->format, subresource->aspectMask);
++      const uint64_t row_blocks =
++         DIV_ROUND_UP((uint64_t)(row_length ? row_length : extent.width), block.width);
++      const uint64_t image_rows = DIV_ROUND_UP(
++         (uint64_t)(image_height ? image_height : extent.height), block.height);
++      const uint64_t width_blocks = DIV_ROUND_UP((uint64_t)extent.width, block.width);
++      const uint64_t height_blocks =
++         DIV_ROUND_UP((uint64_t)extent.height, block.height);
++      const uint64_t depth_blocks = DIV_ROUND_UP((uint64_t)extent.depth, block.depth);
++
++      size_t row_pitch, slice_pitch, layer_pitch, last_row, last_slice, last_layer,
++         row_bytes;
++      if (__builtin_mul_overflow(row_blocks, block.size, &row_pitch) ||
++          __builtin_mul_overflow(image_rows, row_pitch, &slice_pitch) ||
++          __builtin_mul_overflow(depth_blocks, slice_pitch, &layer_pitch) ||
++          __builtin_mul_overflow(height_blocks - 1, row_pitch, &last_row) ||
++          __builtin_mul_overflow(depth_blocks - 1, slice_pitch, &last_slice) ||
++          __builtin_mul_overflow((uint64_t)layers - 1, layer_pitch, &last_layer) ||
++          __builtin_mul_overflow(width_blocks, block.size, &row_bytes) ||
++          __builtin_add_overflow(last_row, last_slice, &reach) ||
++          __builtin_add_overflow(reach, last_layer, &reach) ||
++          __builtin_add_overflow(reach, row_bytes, &reach))
++         return false;
++   }
++
++   if (target->flags & VK_HOST_IMAGE_COPY_MEMCPY_BIT) {
++      if (!target->vk->GetImageSubresourceLayout2)
++         return false;
++
++      size_t memcpy_reach = 0;
++      for (uint32_t i = 0; i < layers; i++) {
++         const VkImageSubresource2 layer = {
++            .sType = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2,
++            .imageSubresource = {
++               .aspectMask = subresource->aspectMask,
++               .mipLevel = subresource->mipLevel,
++               .arrayLayer = subresource->baseArrayLayer + i,
++            },
++         };
++         VkSubresourceHostMemcpySize size = {
++            .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE,
++         };
++         VkSubresourceLayout2 layout = {
++            .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2,
++            .pNext = &size,
++         };
++         target->vk->GetImageSubresourceLayout2(target->device, target->handle,
++                                                &layer, &layout);
++         if (size.size > SIZE_MAX ||
++             __builtin_add_overflow(memcpy_reach, (size_t)size.size, &memcpy_reach))
++            return false;
++      }
++      reach = MAX2(reach, memcpy_reach);
++   }
++
++   /* The guest sizes its memory for the region it copies, and the footprint
++    * above is that size, or at most vkr_host_copy_block()'s largest texel
++    * block times it where the format is one the tables cannot state.  A
++    * region that reaches further asks for renderer memory the guest never
++    * accounted for, through a row length or image height it chose freely. */
++   if (reach > data_size &&
++       (data_size > SIZE_MAX / VKR_HOST_COPY_MAX_BLOCK_SIZE ||
++        reach > data_size * VKR_HOST_COPY_MAX_BLOCK_SIZE)) {
++      vkr_log("host image copy: the region reaches %zu bytes, past what its %zu "
++              "bytes of memory could hold", reach, data_size);
++      return false;
++   }
++
++   *footprint = reach;
++   return true;
++}
++
++/* The driver copies image to image through one temporary the size of the source
++ * plane: it reads the source region packed into it, then writes the same
++ * extent from it into the destination, over the layers of the source.  A
++ * region outside either image, layers that differ, or a destination that takes
++ * more bytes than the source gave would make it touch memory neither image has
++ * or read what it never wrote, so both sides are held to the checks of a copy
++ * to and from memory.  The destination's extent is the region's, as the driver
++ * reads it. */
++static bool
++vkr_host_copy_images_hold_regions(struct vn_device_proc_table *vk,
++                                  VkDevice device,
++                                  const VkCopyImageToImageInfo *info)
++{
++   const struct vkr_image *src = vkr_image_from_handle(info->srcImage);
++   const struct vkr_image *dst = vkr_image_from_handle(info->dstImage);
++   if (!src || !dst) {
++      vkr_log("host image copy: an image of an image-to-image copy is the null handle");
++      return false;
++   }
++   if (info->regionCount && !info->pRegions) {
++      vkr_log("host image copy: an image-to-image copy names regions and sends none");
++      return false;
++   }
++
++   const struct vkr_host_copy_target src_target = {
++      .vk = vk, .device = device, .image = src, .handle = info->srcImage, .flags = 0,
++   };
++   const struct vkr_host_copy_target dst_target = {
++      .vk = vk, .device = device, .image = dst, .handle = info->dstImage, .flags = 0,
++   };
++   for (uint32_t i = 0; i < info->regionCount; i++) {
++      const VkImageCopy2 *region = &info->pRegions[i];
++      size_t src_reach, dst_reach;
++      uint32_t src_layers, dst_layers;
++
++      if (!vkr_host_copy_layer_count(src, &region->srcSubresource, &src_layers) ||
++          !vkr_host_copy_footprint(&src_target, &region->srcSubresource, 0, 0,
++                                   region->srcOffset, region->extent, SIZE_MAX,
++                                   &src_reach)) {
++         vkr_log("host image copy: the source of an image-to-image copy does not hold "
++                 "its region");
++         return false;
++      }
++      if (!vkr_host_copy_layer_count(dst, &region->dstSubresource, &dst_layers) ||
++          !vkr_host_copy_footprint(&dst_target, &region->dstSubresource, 0, 0,
++                                   region->dstOffset, region->extent, SIZE_MAX,
++                                   &dst_reach)) {
++         vkr_log("host image copy: the destination of an image-to-image copy does not "
++                 "hold its region");
++         return false;
++      }
++      if (src_layers != dst_layers || dst_reach > src_reach) {
++         vkr_log("host image copy: the two sides of an image-to-image copy do not "
++                 "move the same layers and bytes");
++         return false;
++      }
++   }
++   return true;
++}
++
++static void
++vkr_dispatch_vkCopyImageToImage(UNUSED struct vn_dispatch_context *dispatch,
++                                struct vn_command_vkCopyImageToImage *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
+ 
+-   vn_replace_vkTransitionImageLayout_args_handle(args);
+-   args->ret =
+-      vk->TransitionImageLayout(args->device, args->transitionCount, args->pTransitions);
++   if (!vkr_host_copy_images_hold_regions(vk, args->device, args->pCopyImageToImageInfo)) {
++      args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++      return;
++   }
++
++   vn_replace_vkCopyImageToImage_args_handle(args);
++   args->ret = vk->CopyImageToImage(args->device, args->pCopyImageToImageInfo);
+ }
+ 
++/* A host image copy hands the driver a host pointer into memory whose size
++ * the guest chose: the reply blob of vkCopyImageToMemoryMESA, or the decoded
++ * command data of vkCopyMemoryToImageMESA.  The driver reaches as far as the
++ * region's footprint, so a region whose footprint fits is copied in place.
++ * Otherwise the driver gets renderer memory of the whole footprint, zeroed
++ * for an upload, and only the bytes the guest allocated or supplied move
++ * between it and the guest.  A region whose footprint cannot be stated is
++ * refused.
++ */
+ static void
+ vkr_dispatch_vkCopyImageToMemoryMESA(UNUSED struct vn_dispatch_context *dispatch,
+                                      struct vn_command_vkCopyImageToMemoryMESA *args)
+ {
+    struct vkr_device *dev = vkr_device_from_handle(args->device);
+    struct vn_device_proc_table *vk = &dev->proc_table;
++   const VkCopyImageToMemoryInfoMESA *info = args->pCopyImageToMemoryInfo;
++   const struct vkr_image *image = vkr_image_from_handle(info->srcImage);
+ 
+    vn_replace_vkCopyImageToMemoryMESA_args_handle(args);
+ 
+-   const VkCopyImageToMemoryInfoMESA *info = args->pCopyImageToMemoryInfo;
++   const struct vkr_host_copy_target target = {
++      .vk = vk,
++      .device = args->device,
++      .image = image,
++      .handle = info->srcImage,
++      .flags = info->flags,
++   };
++   size_t footprint;
++   if (!image || !vkr_host_copy_footprint(&target, &info->imageSubresource,
++                                          info->memoryRowLength,
++                                          info->memoryImageHeight, info->imageOffset,
++                                          info->imageExtent, args->dataSize,
++                                          &footprint)) {
++      args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++      return;
++   }
++
++   /* The driver writes the texels of the region and leaves the padding of a
++    * longer row or image height as it found it, and the reply carries the first
++    * dataSize bytes, so the staging memory starts zeroed: the padding must not
++    * be what the allocator last held. */
++   void *staging = NULL;
++   if (footprint > args->dataSize) {
++      staging = calloc(1, footprint);
++      if (!staging) {
++         args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++         return;
++      }
++   }
++
+    const VkImageToMemoryCopy local_region = {
+       .sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY,
+-      .pHostPointer = args->pData,
++      .pHostPointer = staging ? staging : args->pData,
+       .memoryRowLength = info->memoryRowLength,
+       .memoryImageHeight = info->memoryImageHeight,
+       .imageSubresource = info->imageSubresource,
+@@ -61,26 +897,46 @@ vkr_dispatch_vkCopyImageToMemoryMESA(UNUSED struct vn_dispatch_context *dispatch
+       .pRegions = &local_region,
+    };
+    args->ret = vk->CopyImageToMemory(args->device, &local_info);
++
++   if (staging) {
++      if (args->dataSize)
++         memcpy(args->pData, staging, args->dataSize);
++      free(staging);
++   }
+ }
+ 
+-static void
+-vkr_dispatch_vkCopyMemoryToImageMESA(UNUSED struct vn_dispatch_context *dispatch,
+-                                     struct vn_command_vkCopyMemoryToImageMESA *args)
++/* Describe each region to the driver, staging one whose footprint the data the
++ * guest sent does not cover.  Every staging buffer is left in staging[] for
++ * the caller to free, whether or not this succeeds. */
++static bool
++vkr_host_copy_stage_regions(const struct vkr_host_copy_target *target,
++                            const VkMemoryToImageCopyMESA *regions,
++                            uint32_t count,
++                            VkMemoryToImageCopy *local_regions,
++                            void **staging)
+ {
+-   struct vkr_device *dev = vkr_device_from_handle(args->device);
+-   struct vn_device_proc_table *vk = &dev->proc_table;
+-
+-   vn_replace_vkCopyMemoryToImageMESA_args_handle(args);
++   for (uint32_t i = 0; i < count; i++) {
++      size_t footprint;
++      if (!vkr_host_copy_footprint(target, &regions[i].imageSubresource,
++                                   regions[i].memoryRowLength,
++                                   regions[i].memoryImageHeight,
++                                   regions[i].imageOffset, regions[i].imageExtent,
++                                   regions[i].dataSize, &footprint))
++         return false;
+ 
+-   const VkCopyMemoryToImageInfoMESA *info = args->pCopyMemoryToImageInfo;
+-   const VkMemoryToImageCopyMESA *regions = info->pRegions;
++      const void *data = regions[i].pData;
++      if (footprint > regions[i].dataSize) {
++         staging[i] = calloc(1, footprint);
++         if (!staging[i])
++            return false;
++         if (regions[i].dataSize)
++            memcpy(staging[i], regions[i].pData, regions[i].dataSize);
++         data = staging[i];
++      }
+ 
+-   STACK_ARRAY(VkMemoryToImageCopy, local_regions, info->regionCount);
+-
+-   for (uint32_t i = 0; i < info->regionCount; i++) {
+       local_regions[i] = (VkMemoryToImageCopy){
+          .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY,
+-         .pHostPointer = regions[i].pData,
++         .pHostPointer = data,
+          .memoryRowLength = regions[i].memoryRowLength,
+          .memoryImageHeight = regions[i].memoryImageHeight,
+          .imageSubresource = regions[i].imageSubresource,
+@@ -88,17 +944,52 @@ vkr_dispatch_vkCopyMemoryToImageMESA(UNUSED struct vn_dispatch_context *dispatch
+          .imageExtent = regions[i].imageExtent,
+       };
+    }
++   return true;
++}
++
++static void
++vkr_dispatch_vkCopyMemoryToImageMESA(UNUSED struct vn_dispatch_context *dispatch,
++                                     struct vn_command_vkCopyMemoryToImageMESA *args)
++{
++   struct vkr_device *dev = vkr_device_from_handle(args->device);
++   struct vn_device_proc_table *vk = &dev->proc_table;
++   const VkCopyMemoryToImageInfoMESA *info = args->pCopyMemoryToImageInfo;
++   const struct vkr_image *image = vkr_image_from_handle(info->dstImage);
++
++   vn_replace_vkCopyMemoryToImageMESA_args_handle(args);
+ 
+-   const VkCopyMemoryToImageInfo local_info = {
+-      .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO,
++   const struct vkr_host_copy_target target = {
++      .vk = vk,
++      .device = args->device,
++      .image = image,
++      .handle = info->dstImage,
+       .flags = info->flags,
+-      .dstImage = info->dstImage,
+-      .dstImageLayout = info->dstImageLayout,
+-      .regionCount = info->regionCount,
+-      .pRegions = local_regions,
+    };
+-   args->ret = vk->CopyMemoryToImage(args->device, &local_info);
++   const uint32_t count = image ? info->regionCount : 0;
++
++   STACK_ARRAY(VkMemoryToImageCopy, local_regions, count);
++   STACK_ARRAY(void *, staging, count);
++
++   args->ret = VK_ERROR_OUT_OF_HOST_MEMORY;
++   if (image && local_regions && staging) {
++      memset(staging, 0, count * sizeof(*staging));
++      if (vkr_host_copy_stage_regions(&target, info->pRegions, count, local_regions,
++                                      staging)) {
++         const VkCopyMemoryToImageInfo local_info = {
++            .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO,
++            .flags = info->flags,
++            .dstImage = info->dstImage,
++            .dstImageLayout = info->dstImageLayout,
++            .regionCount = count,
++            .pRegions = local_regions,
++         };
++         args->ret = vk->CopyMemoryToImage(args->device, &local_info);
++      }
++      for (uint32_t i = 0; i < count; i++)
++         free(staging[i]);
++   }
+ 
++   STACK_ARRAY_FINISH(staging);
+    STACK_ARRAY_FINISH(local_regions);
+ }
+ 
+diff --git a/src/venus/vkr_image.c b/src/venus/vkr_image.c
+index 4248c95b9cf2cf6c04f46d1533d45d636b33ae53..c8a6358a048a3d4cec743df88b090936c48e68ac 100644
+--- a/src/venus/vkr_image.c
++++ b/src/venus/vkr_image.c
+@@ -31,7 +31,15 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
+     * situation because the app does not consider the memory external.
+     */
+ 
+-   vkr_image_create_and_add(dispatch->data, args);
++   const VkFormat format = args->pCreateInfo->format;
++   const uint32_t mip_levels = args->pCreateInfo->mipLevels;
++   const uint32_t array_layers = args->pCreateInfo->arrayLayers;
++   struct vkr_image *image = vkr_image_create_and_add(dispatch->data, args);
++   if (image) {
++      image->format = format;
++      image->mip_levels = mip_levels;
++      image->array_layers = array_layers;
++   }
+ }
+ 
+ static void
+diff --git a/src/venus/vkr_image.h b/src/venus/vkr_image.h
+index 70a980023cbb3aceca515d66e1851d2da8fd9781..ef1d33b8870c49ba40b273b999ce3ee05d9c00f2 100644
+--- a/src/venus/vkr_image.h
++++ b/src/venus/vkr_image.h
+@@ -10,6 +10,10 @@
+ 
+ struct vkr_image {
+    struct vkr_object base;
++   /* What a host image copy needs to know how far its region reaches. */
++   VkFormat format;
++   uint32_t mip_levels;
++   uint32_t array_layers;
+ };
+ VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
+ 
