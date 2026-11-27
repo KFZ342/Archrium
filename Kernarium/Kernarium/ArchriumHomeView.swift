@@ -263,6 +263,12 @@ struct ArchriumHomeView: View {
                     importError = failure
                     return
                 }
+                // A multi-gigabyte image is reproducible; keeping it out of
+                // iCloud backups saves the user's quota.
+                var values = URLResourceValues()
+                values.isExcludedFromBackup = true
+                var storedDestination = destination
+                try? storedDestination.setResourceValues(values)
                 // The writable layer describes the old base image.
                 OverlayDisk.reset()
                 refresh()

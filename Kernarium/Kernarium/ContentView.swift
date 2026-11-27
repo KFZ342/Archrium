@@ -849,11 +849,14 @@ enum OverlayDisk {
         )
         let requestedByteCount = try byteCount(forSizeGiB: sizeGiB)
         let owner = ownerValue(for: rootfs)
+        let storedOwner = (try? Data(contentsOf: ownerURL)).flatMap {
+            String(data: $0, encoding: .utf8)
+        }
 
         var createLayer = !manager.fileExists(atPath: disk.path)
         if !createLayer,
            let owner,
-           let stored = try? String(contentsOf: ownerURL, encoding: .utf8),
+           let stored = storedOwner,
            stored != owner {
             // The guest changed its base image. Files and whiteouts in this
             // layer describe the old one; remove it before mounting it over

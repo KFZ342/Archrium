@@ -414,7 +414,11 @@ private enum VirtualKeySender {
         switch modifier {
         case .control: LinuxKeyboard.leftControl
         case .option: LinuxKeyboard.leftAlt
-        case .command: LinuxKeyboard.leftSuper
+        case .command:
+            // Match the hardware keyboard's Command-as-Control setting.
+            UserDefaults.standard.bool(
+                forKey: ArchriumKeyboardSettings.commandAsControlKey
+            ) ? LinuxKeyboard.leftControl : LinuxKeyboard.leftSuper
         case .shift: LinuxKeyboard.leftShift
         }
     }

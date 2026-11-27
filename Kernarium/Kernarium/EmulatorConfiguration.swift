@@ -486,7 +486,10 @@ enum RootfsImage {
             return GuestBundle.load(at: url, fileManager: fileManager)
                 .map(GuestSelection.bundle)
         }
-        if fileManager.fileExists(atPath: url.path) {
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(
+            atPath: url.path, isDirectory: &isDirectory
+        ), !isDirectory.boolValue {
             return .image(url, flavor: .linux)
         }
         // The image shipped in the signed bundle is read-only and is booted
