@@ -79,6 +79,7 @@ struct GuestDisplayView: UIViewControllerRepresentable {
         view.autoResizeDrawable = false
         view.isMultipleTouchEnabled = true
         view.hardwareInput = hardwareInput
+        view.setHardwareFocus(hardwareFocus)
         view.applyAccessibility(accessibility)
         return GuestDisplayViewController(metalView: view)
     }
@@ -92,12 +93,14 @@ struct GuestDisplayView: UIViewControllerRepresentable {
         view.contactDidChange = contactDidChange
         view.scale = scale
         view.hardwareInput = hardwareInput
+        if let guestContentSize = view.guestContentSize {
+            view.hardwareInput?.pointerPixelSize = guestContentSize
+        }
         view.applyAccessibility(accessibility)
         if let keyboardVisible {
             view.setKeyboardVisible(keyboardVisible.wrappedValue)
-        } else {
-            view.setHardwareFocus(hardwareFocus)
         }
+        view.setHardwareFocus(hardwareFocus)
         view.reportLayout()
     }
 
@@ -200,7 +203,7 @@ class GuestMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInteraction
     var scale = GuestDisplayScale.points
     @objc private(set) var umlGuestResizeInProgress = false
     private var touchContacts = GuestTouchContacts<ObjectIdentifier>()
-    private var guestContentSize: CGSize?
+    var guestContentSize: CGSize?
     private var hardwareFocusWanted = false
     private var hoverRecognizer: UIHoverGestureRecognizer?
     private var scrollRecognizers: [UIPanGestureRecognizer] = []
@@ -326,6 +329,9 @@ class GuestMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInteraction
             width: CGFloat(width),
             height: CGFloat(height)
         )
+        if let guestContentSize {
+            hardwareInput?.pointerPixelSize = guestContentSize
+        }
     }
 
     func applyAccessibility(_ accessibility: GuestDisplayAccessibility?) {
@@ -377,7 +383,9 @@ class GuestMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInteraction
     func setKeyboardVisible(_ visible: Bool) {
         if visible {
             becomeFirstResponder()
-        } else {
+        } else if !hardwareFocusWanted {
+            // A hardware keyboard keeps the view first responder without the
+            // software keyboard; only a view that wants neither lets go.
             resignFirstResponder()
         }
     }
@@ -748,6 +756,28 @@ class GuestMetalView: MTKView, UIGestureRecognizerDelegate, UIPointerInteraction
 /// keyboard map, by character. Andarium's view takes no text, and its keys
 /// are positions (`GuestHardwareInput`).
 final class TextGuestMetalView: GuestMetalView, UIKeyInput {
+    /// Whether the system's software keyboard should be shown. The view is
+    /// also first responder for a hardware keyboard, where iOS must not put
+    /// its own keyboard over the guest.
+    private var softwareKeyboardVisible = false
+    private lazy var keyboardlessInputView = UIView(frame: .zero)
+
+    override var inputView: UIView? {
+        get { softwareKeyboardVisible ? super.inputView : keyboardlessInputView }
+        set { super.inputView = newValue }
+    }
+
+    override var inputAccessoryView: UIView? {
+        get { softwareKeyboardVisible ? super.inputAccessoryView : nil }
+        set { super.inputAccessoryView = newValue }
+    }
+
+    override func setKeyboardVisible(_ visible: Bool) {
+        softwareKeyboardVisible = visible
+        super.setKeyboardVisible(visible)
+        reloadInputViews()
+    }
+
     var hasText: Bool { true }
     var keyboardType: UIKeyboardType = .asciiCapable
     var autocorrectionType: UITextAutocorrectionType = .no

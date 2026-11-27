@@ -39,8 +39,44 @@ final class GuestHardwareInput {
 
     weak var sink: (any GuestHardwareSink)?
     private let clock: () -> Double
+    /// Android keeps its own Caps Lock light and toggles it with the key; iOS
+    /// keeps another. Linux's evdev keyboard is the only Caps Lock, so a Linux
+    /// guest must not have the Android reconciliation tap it.
+    var reconcilesCapsLock = true
+    /// Linux desktops take a relative mouse, not Android's absolute pointer
+    /// (which libinput reads as a tablet or touchscreen). In this mode the
+    /// system pointer's absolute position is turned into motion for the
+    /// guest's mouse device, and its buttons go with that report.
+    var usesRelativePointer = false
+    /// The guest's display size in pixels, which turns the pointer's
+    /// normalized position into the mouse's motion.
+    var pointerPixelSize = CGSize(width: 1920, height: 1080)
+    private var relativePosition: GuestPointerMapping.Position?
+    private var relativeButtons: UInt32 = 0
+
+    /// Linux's evdev keyboard has no auto-repeat of its own in this runtime:
+    /// the runtime's hardware keyboard sends one down and one up per key.
+    /// While a repeatable key stays down, repeat it as a down/up pair, which
+    /// is what a guest's text input sees as typing a key faster.
+    var repeatsKeys = false
+    var keyRepeatDelay: TimeInterval = 0.5
+    var keyRepeatInterval: TimeInterval = 1.0 / 30
+    /// A PC keyboard's Ctrl sits where an Apple keyboard's Command key does
+    /// for many people; this sends Command as Ctrl instead of Super.
+    var commandAsControl = false
+    /// Vim and terminal users often want Escape where Caps Lock is.
+    var capsLockAsEscape = false
 
     private var keys = HardwareKeyboardState()
+    /// The guest-side usage each physical key was sent as when it went down,
+    /// so a mapping changed while a key is held cannot lift another key.
+    private var sentUsages: [UInt32: UInt32] = [:]
+    /// How many physical keys are currently sent as each guest usage. Command
+    /// and Control can both become Ctrl; the guest must see one down and one
+    /// up, not one up while the other is still held.
+    private var canonicalHeld: [UInt32: Int] = [:]
+    private var repeatTimer: Timer?
+    private var repeatUsage: UInt32?
     private var capsLock = CapsLockReconciler()
     private var pointer = GuestPointerTracker()
     private var continuousScroll = ScrollAccumulator(pointsPerDetent: continuousPointsPerDetent)
@@ -134,25 +170,35 @@ final class GuestHardwareInput {
     /// A key went down. `alphaShift` is iOS's Caps Lock state.
     func keyDown(usage: UInt32, alphaShift: Bool) {
         guard isActive, HardwareKeyboardState.usages.contains(usage) else { return }
+        let wasHeld = keys.isHeld(usage)
         sink?.hardwareKeyboardUsed()
-        let now = clock()
-        if usage == HardwareKeyboardState.capsLockUsage {
-            capsLock.capsLockKeyForwarded(at: now)
-        } else if capsLock.reconcile(alphaShift: alphaShift, at: now) {
-            // Android's Caps Lock was not iOS's: tap it before this key.
-            sink?.hardwareKey(usage: HardwareKeyboardState.capsLockUsage, pressed: true)
-            sink?.hardwareKey(usage: HardwareKeyboardState.capsLockUsage, pressed: false)
+        if reconcilesCapsLock {
+            let now = clock()
+            if usage == HardwareKeyboardState.capsLockUsage {
+                capsLock.capsLockKeyForwarded(at: now)
+            } else if capsLock.reconcile(alphaShift: alphaShift, at: now) {
+                // Android's Caps Lock was not iOS's: tap it before this key.
+                sink?.hardwareKey(usage: HardwareKeyboardState.capsLockUsage, pressed: true)
+                sink?.hardwareKey(usage: HardwareKeyboardState.capsLockUsage, pressed: false)
+            }
         }
         send(keys.press(usage))
+        if repeatsKeys, !wasHeld, isRepeatable(usage) {
+            beginRepeat(usage)
+        }
     }
 
     func keyUp(usage: UInt32) {
+        if repeatUsage == usage { stopRepeat() }
         send(keys.release(usage))
     }
 
     /// Lifts every key that is down.
     func releaseKeys() {
+        stopRepeat()
         send(keys.releaseAll())
+        sentUsages.removeAll()
+        canonicalHeld.removeAll()
     }
 
     /// Android's Caps Lock light changed.
@@ -166,7 +212,98 @@ final class GuestHardwareInput {
     }
 
     private func send(_ events: [HardwareKeyEvent]) {
-        for event in events { sink?.hardwareKey(usage: event.usage, pressed: event.pressed) }
+        for event in events {
+            send(usage: event.usage, pressed: event.pressed)
+        }
+    }
+
+    /// The usage the guest is told for a physical key, after the Linux
+    /// keyboard choices.
+    private func guestUsage(_ usage: UInt32) -> UInt32 {
+        if capsLockAsEscape, usage == HardwareKeyboardState.capsLockUsage {
+            return 0x29 // HID Escape
+        }
+        if commandAsControl {
+            switch usage {
+            case 0xE3: return 0xE0 // left Command → left Control
+            case 0xE7: return 0xE4 // right Command → right Control
+            default: break
+            }
+        }
+        return usage
+    }
+
+    /// Sends a physical key as the guest usage it maps to. Two physical keys
+    /// that map to one usage are counted so the guest sees one down and one
+    /// up, whichever of them is released last.
+    private func send(usage physical: UInt32, pressed: Bool) {
+        if pressed {
+            let usage = guestUsage(physical)
+            sentUsages[physical] = usage
+            let count = canonicalHeld[usage, default: 0]
+            canonicalHeld[usage] = count + 1
+            if count == 0 { sink?.hardwareKey(usage: usage, pressed: true) }
+            return
+        }
+        let usage = sentUsages.removeValue(forKey: physical) ??
+            guestUsage(physical)
+        guard let count = canonicalHeld[usage], count > 0 else { return }
+        if count == 1 {
+            canonicalHeld.removeValue(forKey: usage)
+            sink?.hardwareKey(usage: usage, pressed: false)
+        } else {
+            canonicalHeld[usage] = count - 1
+        }
+    }
+
+    private func isRepeatable(_ usage: UInt32) -> Bool {
+        !HardwareKeyboardState.modifierUsages.contains(usage) &&
+            usage != HardwareKeyboardState.capsLockUsage
+    }
+
+    private func beginRepeat(_ usage: UInt32) {
+        stopRepeat()
+        repeatUsage = usage
+        let timer = Timer(timeInterval: keyRepeatDelay, repeats: false) {
+            [weak self] _ in
+            self?.beginRepeating()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        repeatTimer = timer
+    }
+
+    private func beginRepeating() {
+        guard isActive, repeatsKeys, let usage = repeatUsage,
+            keys.isHeld(usage) else {
+            stopRepeat()
+            return
+        }
+        let timer = Timer(timeInterval: keyRepeatInterval, repeats: true) {
+            [weak self] _ in
+            self?.repeatOnce()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        repeatTimer = timer
+    }
+
+    /// One repeat is a release and a press: the runtime's keyboard refuses a
+    /// second press of a key it already holds, and a guest's text input reads
+    /// the pair as one more character.
+    private func repeatOnce() {
+        guard isActive, repeatsKeys, let physical = repeatUsage,
+            keys.isHeld(physical) else {
+            stopRepeat()
+            return
+        }
+        let usage = guestUsage(physical)
+        sink?.hardwareKey(usage: usage, pressed: false)
+        sink?.hardwareKey(usage: usage, pressed: true)
+    }
+
+    private func stopRepeat() {
+        repeatTimer?.invalidate()
+        repeatTimer = nil
+        repeatUsage = nil
     }
 
     // MARK: Pointer
@@ -190,6 +327,19 @@ final class GuestHardwareInput {
             lastHover = nil
         }
         guard routesMouse else { return }
+        if usesRelativePointer {
+            guard let position, position.inside else {
+                relativePosition = nil
+                return
+            }
+            let step = relativeMotion(to: position)
+            relativePosition = position
+            guard step.dx != 0 || step.dy != 0 else { return }
+            sink?.hardwareMouse(
+                dx: step.dx, dy: step.dy, buttons: relativeButtons,
+                wheel: 0, horizontalWheel: 0)
+            return
+        }
         send(pointer.hover(position))
     }
 
@@ -197,6 +347,24 @@ final class GuestHardwareInput {
     func pointerTouch(_ phase: GuestPointerTracker.Phase, at position: GuestPointerMapping.Position?, buttons: UInt32) {
         guard routesMouse else { return }
         if phase == .began { sink?.hardwarePointerUsed() }
+        if usesRelativePointer {
+            relativeButtons = buttons
+            let step: (dx: Int32, dy: Int32)
+            if let position, position.inside {
+                step = relativeMotion(to: position)
+                relativePosition = position
+            } else {
+                step = (0, 0)
+            }
+            sink?.hardwareMouse(
+                dx: step.dx, dy: step.dy, buttons: buttons,
+                wheel: 0, horizontalWheel: 0)
+            if phase == .ended || phase == .cancelled {
+                relativeButtons = 0
+                relativePosition = nil
+            }
+            return
+        }
         send(pointer.touch(phase, at: position, buttons: buttons))
     }
 
@@ -229,8 +397,29 @@ final class GuestHardwareInput {
         guard steps.wheel != 0 || steps.horizontalWheel != 0 else { return }
         sink?.hardwarePointerUsed()
         // The buttons are the pointer's: the mouse reports none of its own
-        // until Android captures the pointer.
-        sink?.hardwareMouse(dx: 0, dy: 0, buttons: 0, wheel: steps.wheel, horizontalWheel: steps.horizontalWheel)
+        // until Android captures the pointer. A Linux relative mouse keeps
+        // whatever button the pointer holds.
+        let buttons = usesRelativePointer ? relativeButtons : 0
+        sink?.hardwareMouse(
+            dx: 0, dy: 0, buttons: buttons,
+            wheel: steps.wheel, horizontalWheel: steps.horizontalWheel)
+    }
+
+    /// The pointer's normalized positions are 0...32767; the guest's mouse
+    /// takes pixels. A Linux desktop expects the latter.
+    private func relativeMotion(
+        to position: GuestPointerMapping.Position
+    ) -> (dx: Int32, dy: Int32) {
+        guard let previous = relativePosition else { return (0, 0) }
+        let width = max(pointerPixelSize.width, 1)
+        let height = max(pointerPixelSize.height, 1)
+        let unit = Double(GuestPointerMapping.maximum) + 1
+        let dx = Double(Int64(position.x) - Int64(previous.x)) * width / unit
+        let dy = Double(Int64(position.y) - Int64(previous.y)) * height / unit
+        return (
+            Int32(clamping: Int(dx.rounded())),
+            Int32(clamping: Int(dy.rounded()))
+        )
     }
 
     /// Ends the pointer's contact and lifts its buttons.
@@ -238,6 +427,15 @@ final class GuestHardwareInput {
         lastHover = nil
         continuousScroll.reset()
         discreteScroll.reset()
+        if usesRelativePointer {
+            if relativeButtons != 0 {
+                relativeButtons = 0
+                sink?.hardwareMouse(
+                    dx: 0, dy: 0, buttons: 0, wheel: 0, horizontalWheel: 0)
+            }
+            relativePosition = nil
+            return
+        }
         send(pointer.leave())
     }
 

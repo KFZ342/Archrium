@@ -11,6 +11,12 @@ struct EmulatorSettingsView: View {
     @State private var configuration: EmulatorConfiguration
     @State private var backgroundMode: BackgroundMode
     @State private var backgroundLimitMinutes: Int
+    @AppStorage(ArchriumKeyboardSettings.commandAsControlKey)
+    private var commandAsControl = false
+    @AppStorage(ArchriumKeyboardSettings.capsLockAsEscapeKey)
+    private var capsLockAsEscape = false
+    @AppStorage(ArchriumKeyboardSettings.keyRepeatKey)
+    private var keyRepeat = true
 
     private let maximumVCPUCount: Int
     private let defaults: UserDefaults
@@ -147,6 +153,37 @@ struct EmulatorSettingsView: View {
                         in: EmulatorConfiguration.overlaySizeRangeGiB
                     )
                     .accessibilityIdentifier("overlaySizeStepper")
+                }
+
+                if !androidBundleSelected {
+                    Section("Linux keyboard") {
+                        Toggle(
+                            "Command sends Ctrl",
+                            isOn: $commandAsControl
+                        )
+                        .accessibilityIdentifier("linuxCommandAsControlToggle")
+
+                        Toggle(
+                            "Caps Lock sends Escape",
+                            isOn: $capsLockAsEscape
+                        )
+                        .accessibilityIdentifier("linuxCapsLockAsEscapeToggle")
+
+                        Toggle(
+                            "Repeat keys held down",
+                            isOn: $keyRepeat
+                        )
+                        .accessibilityIdentifier("linuxKeyRepeatToggle")
+
+                        Text(
+                            "Command otherwise stays Super and Option stays " +
+                                "Alt, as on a PC. These apply at once to a " +
+                                "running Linux guest. iOS keeps Command-Tab " +
+                                "and Command-H for itself."
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    }
                 }
 
                 // Unlike the rest of the form this applies at once, whatever

@@ -7,6 +7,7 @@ import MetalKit
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var serialConsole = SerialConsoleController()
     @ObservedObject private var launcher = EmulatorLauncher.shared
     @ObservedObject private var backgroundSession = BackgroundSession.shared
@@ -26,6 +27,16 @@ struct ContentView: View {
     @State private var sceneCoversScreen = false
     @Namespace private var floatingButtonNamespace
 
+    /// The guest is on screen and nothing (a sheet, the pause notice, a
+    /// background scene) should take its physical keyboard and mouse.
+    private var hardwareFocusActive: Bool {
+        launcher.phase == .running
+            && guestViewMode == .framebuffer
+            && !settingsPresented
+            && spacePause.pause == nil
+            && scenePhase == .active
+    }
+
     var body: some View {
         ZStack(alignment: .trailing) {
             ZStack {
@@ -35,7 +46,9 @@ struct ContentView: View {
 
                 GuestDisplayView(
                     keyboardVisible: $framebufferKeyboardVisible,
-                    scale: EmulatorLauncher.shared.displayScale
+                    scale: EmulatorLauncher.shared.displayScale,
+                    hardwareInput: ArchriumHardwareInput.shared.input,
+                    hardwareFocus: hardwareFocusActive
                 ) { view, geometry in
                     EmulatorLauncher.shared.start(view: view, geometry: geometry)
                 }
@@ -132,6 +145,7 @@ struct ContentView: View {
         }
         .onAppear {
             serialConsole.startObserving()
+            syncHardwareInput()
             let window = GuestPictureInPicture.shared
             window.wanted = {
                 // A guest paused for space is not shown in a window.
@@ -169,6 +183,7 @@ struct ContentView: View {
             refreshKeepRunning()
         }
         .onChange(of: spacePause.pause != nil) { _, paused in
+            syncHardwareInput()
             // The screen over the guest says why it is paused, and a sheet
             // or a keyboard would cover it.
             guard paused else { return }
@@ -176,8 +191,19 @@ struct ContentView: View {
             framebufferKeyboardVisible = false
             serialConsole.resignFirstResponder()
         }
+        .onChange(of: guestViewMode) { _, _ in
+            syncHardwareInput()
+        }
+        .onChange(of: settingsPresented) { _, presented in
+            if presented { framebufferKeyboardVisible = false }
+            syncHardwareInput()
+        }
+        .onChange(of: scenePhase) { _, _ in
+            syncHardwareInput()
+        }
         .onChange(of: launcher.phase) { _, phase in
             GuestPictureInPicture.shared.guestRunningChanged(phase == .running)
+            syncHardwareInput()
             refreshKeepRunning()
             if phase == .running { startJobIfAutomationAsked() }
             // Nothing is left to type into, and the keyboard would cover
@@ -186,6 +212,15 @@ struct ContentView: View {
             framebufferKeyboardVisible = false
             serialConsole.resignFirstResponder()
         }
+    }
+
+    /// The Linux guest's physical keyboard and mouse follow the run and what
+    /// is in front, not the view mode's own keyboard focus.
+    private func syncHardwareInput() {
+        ArchriumHardwareInput.shared.update(
+            running: launcher.phase == .running,
+            foreground: hardwareFocusActive
+        )
     }
 
     @ViewBuilder

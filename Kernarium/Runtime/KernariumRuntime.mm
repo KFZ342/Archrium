@@ -1789,10 +1789,8 @@ public:
 
 private:
     struct Boot final {
-#if KERNARIUM_RUNTIME_ANDROID_GUEST
         /* Before the devices whose threads call it, so it outlives them. */
         std::shared_ptr<uml::input::virtio::HardwareInput> hardwareInput;
-#endif
         std::unique_ptr<uml::input::virtio::InProcessInputService> touchscreen;
         std::unique_ptr<uml::input::virtio::InProcessInputService> keyboard;
         std::unique_ptr<uml::gpu::InProcessVhostUserService> audio;
@@ -1808,15 +1806,16 @@ private:
         std::optional<uml::gnss::InProcessService> gnss;
         /* The cameras, when the host has any. */
         std::unique_ptr<uml::gpu::InProcessVhostUserService> camera;
+#endif
         /* The hardware keyboard, mouse and pointer, the last Virtio devices
-         * of the boot. */
+         * of the boot. They exist for Linux as well as Android: Linux gets
+         * real evdev devices, not touch coordinates standing in for a mouse. */
         std::unique_ptr<uml::input::virtio::InProcessInputService>
             hardwareKeyboard;
         std::unique_ptr<uml::input::virtio::InProcessInputService>
             hardwareMouse;
         std::unique_ptr<uml::input::virtio::InProcessInputService>
             hardwarePointer;
-#endif
         std::optional<ConsoleBridge> console;
         std::vector<std::string> arguments;
         std::vector<const char*> pointers;
@@ -1825,9 +1824,9 @@ private:
         std::optional<ActiveVsockRegistration> vsockRegistration;
 #if KERNARIUM_RUNTIME_ANDROID_GUEST
         std::optional<ActiveGnssRegistration> gnssRegistration;
+#endif
         std::optional<ActiveHardwareInputRegistration>
             hardwareInputRegistration;
-#endif
     };
 
     [[nodiscard]] std::unique_ptr<Boot> buildBoot()
@@ -1995,6 +1994,7 @@ private:
                 request_.camera.mode, cameras_.layout))
             boot->keyboard->setSwitch(
                 {uml::input::virtio::protocol::switchCameraLensCover, true});
+#endif
         /* The hardware keyboard, mouse and pointer come last and stay
          * unplugged until the application plugs them; they are found by name,
          * never by the device's index. */
@@ -2020,7 +2020,6 @@ private:
                     uml::input::virtio::protocol::deviceId));
             }
         }
-#endif
 #if KERNARIUM_RUNTIME_ANDROID_GUEST
         /* The release's read-only system disk and the instance's data disk are
          * the guest's only block devices. The selected ramdisk is exposed from
@@ -2068,8 +2067,8 @@ private:
         boot->vsockRegistration.emplace(boot->vsock->endpoint);
 #if KERNARIUM_RUNTIME_ANDROID_GUEST
         boot->gnssRegistration.emplace(boot->gnss->endpoint);
-        boot->hardwareInputRegistration.emplace(boot->hardwareInput);
 #endif
+        boot->hardwareInputRegistration.emplace(boot->hardwareInput);
         return boot;
     }
 
@@ -2743,9 +2742,7 @@ int runtimeRun(
                  * next guest's GPU, and a stop reaches the loop. */
                 ActiveEmulatorRegistration registration {emulator.get()};
                 ActiveGpuRegistration gpuRegistration {gpuService};
-#if KERNARIUM_RUNTIME_ANDROID_GUEST
                 const ActiveHardwareInputRun hardwareInputRequests;
-#endif
                 const FootprintReporter footprintReporter;
                 result = kernarium::restart::run(guest);
             }
