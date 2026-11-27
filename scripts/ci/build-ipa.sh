@@ -5,6 +5,17 @@ set -eux
 stage=$1
 
 case "$stage" in
+starter)
+  sudo apt-get update
+  sudo apt-get install -y build-essential bison flex gettext libncurses-dev libssl-dev \
+    bc cpio rsync file wget curl unzip python3 git perl tar gzip bzip2 xz-utils
+  rm -rf /tmp/starter-work /tmp/starter-release
+  tools/rootfs/starter/build-all.sh --work /tmp/starter-work --output /tmp/starter-release --product boot-base-aarch64
+  mkdir -p .build/starter
+  BASE=$(find /tmp/starter-release -name uml-boot-base-aarch64.cpio.gz -print -quit)
+  test -n "$BASE"
+  cp "$BASE" .build/starter/uml-boot-base-aarch64.cpio.gz
+  ;;
 deps)
   brew install meson ninja gperf bison flex pkg-config autoconf automake libtool nasm groff
   dependencies/prepare.sh --product macos
@@ -20,6 +31,21 @@ deps)
   dependencies/build-ios-zstd.sh
   ;;
 runtime)
+  mkdir -p .build/rootfs/starter-20260928-boot-base-r1
+  cp .build/starter/uml-boot-base-aarch64.cpio.gz \
+    .build/rootfs/starter-20260928-boot-base-r1/uml-boot-base-aarch64.cpio.gz
+  python3 - <<'PYEOF'
+import hashlib, os
+p='tools/rootfs/boot-ramdisk/accepted-aarch64.env'
+size=os.path.getsize('.build/rootfs/starter-20260928-boot-base-r1/uml-boot-base-aarch64.cpio.gz')
+sha=hashlib.sha256(open('.build/rootfs/starter-20260928-boot-base-r1/uml-boot-base-aarch64.cpio.gz','rb').read()).hexdigest()
+s=open(p).read()
+s=s.replace("UML_BOOT_BASE_SIZE=1398138", f"UML_BOOT_BASE_SIZE={size}")
+import re
+s=re.sub(r"UML_BOOT_BASE_SHA256='[0-9a-f]+'", f"UML_BOOT_BASE_SHA256='{sha}'", s)
+open(p,'w').write(s)
+print('boot base', size, sha)
+PYEOF
   mkdir -p .build/kernel/artifacts
   curl -fL -o /tmp/android-kernel.tar.gz \
     https://github.com/imxieyi/Kernarium/releases/download/andarium-1.1/android-6.18-arm64-4k-20261119-6.18.60-ca1.tar.gz
