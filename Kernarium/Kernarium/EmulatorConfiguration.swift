@@ -434,25 +434,6 @@ enum RootfsImage {
             && FileManager.default.fileExists(atPath: bundledImageURL.path)
     }
 
-    /// Copies the bundled image beside the guest disks, through a temporary
-    /// name so an interrupted first launch never leaves a short image that
-    /// the settings would offer as bootable.
-    nonisolated static func installBundledImageIfNeeded() throws {
-        guard needsBundledImage, let bundledImageURL else { return }
-        let fileManager = FileManager.default
-        let destination = documentsDirectory
-            .appendingPathComponent(defaultFilename)
-        let temporary = documentsDirectory
-            .appendingPathComponent(".archrium.erofs.partial")
-        try? fileManager.removeItem(at: temporary)
-        try fileManager.copyItem(at: bundledImageURL, to: temporary)
-        try fileManager.moveItem(at: temporary, to: destination)
-        var values = URLResourceValues()
-        values.isExcludedFromBackup = true
-        var mutable = destination
-        try? mutable.setResourceValues(values)
-    }
-
     nonisolated static var documentsDirectory: URL {
         FileManager.default.urls(
             for: .documentDirectory,
@@ -500,8 +481,17 @@ enum RootfsImage {
             return GuestBundle.load(at: url, fileManager: fileManager)
                 .map(GuestSelection.bundle)
         }
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
-        return .image(url, flavor: .linux)
+        if fileManager.fileExists(atPath: url.path) {
+            return .image(url, flavor: .linux)
+        }
+        // The image shipped in the signed bundle is read-only and is booted
+        // in place: copying it into Documents would double a multi-gigabyte
+        // payload on a device that has to hold both.
+        if validated == defaultFilename, let bundledImageURL,
+           fileManager.fileExists(atPath: bundledImageURL.path) {
+            return .image(bundledImageURL, flavor: .linux)
+        }
+        return nil
     }
 
     static func selectedFilename(
@@ -523,7 +513,7 @@ enum RootfsImage {
         ) else {
             return []
         }
-        let images: [String] = urls.compactMap { url -> String? in
+        var images: [String] = urls.compactMap { url -> String? in
             guard let filename = validatedFilename(url.lastPathComponent),
                   let values = try? url.resourceValues(
                       forKeys: Set(resourceKeys)
@@ -532,6 +522,10 @@ enum RootfsImage {
                 return nil
             }
             return filename
+        }
+        if let bundledImageURL, fileManager.fileExists(atPath: bundledImageURL.path),
+           !images.contains(defaultFilename) {
+            images.append(defaultFilename)
         }
         let bundles = GuestBundle.availableNames(
             in: directory, fileManager: fileManager
