@@ -117,50 +117,6 @@ private final class RendererFeed: PictureInPictureFeed {
 /// iOS 27: the frames go through the receiver of a render synchronizer that
 /// runs on the host clock, so a frame stamped with the time it is made is due
 /// as it arrives, and each enqueue reports its outcome.
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
-@available(iOS 27.0, *)
-@MainActor
-private final class ReceiverFeed: PictureInPictureFeed {
-    private let synchronizer = AVSampleBufferRenderSynchronizer()
-    private let receiver: AVSampleBufferVideoRenderer.Receiver
-
-    init(layer: AVSampleBufferDisplayLayer) {
-        receiver = synchronizer.sampleBufferReceiver(
-            adding: layer.sampleBufferRenderer
-        )
-    }
-
-    func prepare() {
-        // The timeline is the host clock: no wait for media before it runs.
-        let now = CMClockGetTime(CMClockGetHostTimeClock())
-        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
-        synchronizer.setRate(1, time: now, atHostTime: now)
-    }
-
-    func enqueue(_ sample: CMSampleBuffer) {
-        let ready = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(
-            unsafeBuffer: sample
-        )
-        switch receiver.enqueueImmediately(ready) {
-        case let .cancelledDueToFlushRequiredToResume(error),
-             let .cancelledDueToError(error):
-            // iOS interrupts the layer as the app changes state (-11847); it
-            // takes a flush to accept frames again.
-            print("Archrium: picture in picture layer flushed: \(error)")
-            receiver.flush()
-            _ = receiver.enqueueImmediately(ready)
-        default:
-            break
-        }
-    }
-
-    func flushRemovingDisplayedImage() {
-        let receiver = receiver
-        Task { await receiver.flush(removingDisplayedImage: true) }
-    }
-}
-#endif
-
 private let runtimeFrameSink: kernarium_runtime_frame_sink = { context, buffer in
     guard let context, let buffer else { return }
     let relay = Unmanaged<FrameRelay>.fromOpaque(context).takeUnretainedValue()
@@ -306,14 +262,7 @@ final class GuestPictureInPicture: NSObject, PictureInPictureWindow {
         guard pictureInPicture == nil else { return }
         configureAudioSession()
         if feed == nil {
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
-            if #available(iOS 27.0, *) {
-                feed = ReceiverFeed(layer: layer)
-            } else
-#endif
-            {
-                feed = RendererFeed(layer: layer)
-            }
+            feed = RendererFeed(layer: layer)
         }
         feed?.prepare()
         let source = AVPictureInPictureController.ContentSource(
