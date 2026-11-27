@@ -9,6 +9,7 @@ deps)
   brew install meson ninja gperf bison flex pkg-config autoconf automake libtool nasm groff
   dependencies/prepare.sh --product macos
   dependencies/build.sh
+  python3 -m pip install --user --break-system-packages mako packaging pyyaml
   dependencies/prepare.sh --product apple-gpu-vulkan-experiment
   dependencies/build-apple-gpu.sh --platform ios
   dependencies/prepare.sh --product ios-network
