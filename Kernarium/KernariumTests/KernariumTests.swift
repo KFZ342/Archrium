@@ -658,26 +658,26 @@ struct KernariumTests {
 
     @Test
     @MainActor
-    func overlayDiskIsRecreatedAtRequestedSize() throws {
+    func overlayDiskGrowsWithoutDiscardingTheGuest() throws {
         let manager = FileManager.default
         let directory = try makeScratchDirectory("overlay-disk")
         defer { try? manager.removeItem(at: directory) }
 
-        let first = try OverlayDisk.recreate(sizeGiB: 3, in: directory)
+        let first = try OverlayDisk.prepare(sizeGiB: 3, in: directory)
         let writer = try FileHandle(forWritingTo: first)
         try writer.write(contentsOf: Data([0xa5]))
         try writer.close()
 
-        let second = try OverlayDisk.recreate(sizeGiB: 3, in: directory)
+        let second = try OverlayDisk.prepare(sizeGiB: 4, in: directory)
         let attributes = try manager.attributesOfItem(atPath: second.path)
         let size = attributes[.size] as? NSNumber
         #expect(first == second)
-        #expect(size?.uint64Value == 3 * 1024 * 1024 * 1024)
+        #expect(size?.uint64Value == 4 * 1024 * 1024 * 1024)
 
         let reader = try FileHandle(forReadingFrom: second)
         let prefix = try reader.read(upToCount: 1)
         try reader.close()
-        #expect(prefix == Data([0]))
+        #expect(prefix == Data([0xa5]))
     }
 
     @Test
@@ -1707,6 +1707,9 @@ struct KernariumTests {
             #expect(RootfsImage.validatedFilename(unusable) == nil)
         }
         #expect(RootfsImage.validatedFilename("my-disk_2.ext4") == "my-disk_2.ext4")
+        #expect(
+            RootfsImage.validatedFilename(RootfsImage.overlayFilename) == nil
+        )
     }
 
     @Test
@@ -1744,6 +1747,13 @@ struct KernariumTests {
         #expect(
             manager.createFile(
                 atPath: directory.appendingPathComponent("ignored.img").path,
+                contents: Data()
+            )
+        )
+        #expect(
+            manager.createFile(
+                atPath: directory
+                    .appendingPathComponent(RootfsImage.overlayFilename).path,
                 contents: Data()
             )
         )

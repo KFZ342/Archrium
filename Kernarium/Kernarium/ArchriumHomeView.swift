@@ -7,13 +7,23 @@ import UniformTypeIdentifiers
 /// installed, then start the guest. The session view behind it stays the
 /// proven Kernarium Linux runtime.
 struct ArchriumHomeView: View {
+    @ObservedObject private var launcher = EmulatorLauncher.shared
     @State private var launched = false
     @State private var importing = false
+    @State private var copyingImage = false
     @State private var importError: String?
     @State private var images: [String] = []
     @State private var settingsPresented = false
 
     private var selectedImage: String? { images.first }
+
+    /// The runtime boots one guest per process. Once a run has returned,
+    /// starting again in this process is not what it offers, so the screen
+    /// says how to get another run instead of leaving a dead Start button.
+    private var runEnded: Bool {
+        if case .ended = launcher.phase { return true }
+        return false
+    }
 
     var body: some View {
         NavigationStack {
@@ -56,7 +66,10 @@ struct ArchriumHomeView: View {
             } message: {
                 Text(importError ?? "")
             }
-            .onAppear(perform: refresh)
+            .onAppear {
+                removeStaleImports()
+                refresh()
+            }
         }
         .fullScreenCover(isPresented: $launched) {
             ContentView()
@@ -103,13 +116,28 @@ struct ArchriumHomeView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if runEnded {
+                Text("The last Linux run has ended. Close and reopen Archrium to start another.")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+
             Button {
                 importing = true
             } label: {
-                Label(selectedImage == nil ? "Import image" : "Replace image", systemImage: "square.and.arrow.down")
-                    .frame(maxWidth: .infinity)
+                HStack(spacing: 8) {
+                    if copyingImage {
+                        ProgressView()
+                    } else {
+                        Image(systemName: "square.and.arrow.down")
+                    }
+                    Text(copyingImage ? "Importing…" :
+                        (selectedImage == nil ? "Import image" : "Replace image"))
+                }
+                .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
+            .disabled(copyingImage)
             .accessibilityIdentifier("importImage")
         }
         .padding(18)
@@ -123,7 +151,7 @@ struct ArchriumHomeView: View {
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "play.fill")
-                Text("Start Arch")
+                Text(runEnded ? "Reopen Archrium to run again" : "Start Arch")
                     .font(.headline)
             }
             .frame(maxWidth: .infinity)
@@ -131,7 +159,7 @@ struct ArchriumHomeView: View {
         }
         .buttonStyle(.borderedProminent)
         .tint(.indigo)
-        .disabled(selectedImage == nil)
+        .disabled(selectedImage == nil || copyingImage || runEnded)
         .accessibilityIdentifier("startArch")
     }
 
@@ -159,19 +187,86 @@ struct ArchriumHomeView: View {
         images = RootfsImage.availableFilenames()
     }
 
+    /// An import killed mid-copy leaves a hidden multi-gigabyte temporary
+    /// beside the images. Nothing can resume it, so remove it at launch.
+    private func removeStaleImports() {
+        let manager = FileManager.default
+        // Do not skip hidden files: the temporary itself starts with a dot.
+        guard let all = try? manager.contentsOfDirectory(
+            at: RootfsImage.documentsDirectory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else { return }
+        for url in all {
+            let name = url.lastPathComponent
+            guard name.hasPrefix(".archrium-import-"),
+                  (name as NSString).pathExtension.lowercased() == "erofs"
+            else { continue }
+            try? manager.removeItem(at: url)
+        }
+    }
+
     private func importImage(_ result: Result<[URL], Error>) {
         do {
             guard let source = try result.get().first else { return }
-            let scoped = source.startAccessingSecurityScopedResource()
-            defer { if scoped { source.stopAccessingSecurityScopedResource() } }
-
-            let destination = RootfsImage.documentsDirectory
-                .appendingPathComponent("archrium.erofs")
-            if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.removeItem(at: destination)
+            guard source.pathExtension.lowercased() == "erofs" else {
+                throw NSError(
+                    domain: "Archrium",
+                    code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Only .erofs images can be imported here."
+                    ]
+                )
             }
-            try FileManager.default.copyItem(at: source, to: destination)
-            refresh()
+            let destination = RootfsImage.documentsDirectory
+                .appendingPathComponent(RootfsImage.defaultFilename)
+            let temporary = RootfsImage.documentsDirectory
+                .appendingPathComponent(
+                    ".archrium-import-\(UUID().uuidString).erofs"
+                )
+            let scoped = source.startAccessingSecurityScopedResource()
+            copyingImage = true
+            Task { @MainActor in
+                // A multi-gigabyte copy must not run on the main actor, or
+                // iOS can end the app for a blocked launch screen.
+                let failure: String? = await Task.detached(
+                    priority: .userInitiated
+                ) {
+                    let manager = FileManager.default
+                    do {
+                        if manager.fileExists(atPath: temporary.path) {
+                            try manager.removeItem(at: temporary)
+                        }
+                        try manager.copyItem(at: source, to: temporary)
+                        if manager.fileExists(atPath: destination.path) {
+                            _ = try manager.replaceItemAt(
+                                destination,
+                                withItemAt: temporary,
+                                backupItemName: nil,
+                                options: []
+                            )
+                        } else {
+                            try manager.moveItem(
+                                at: temporary, to: destination
+                            )
+                        }
+                        return nil
+                    } catch {
+                        try? manager.removeItem(at: temporary)
+                        return error.localizedDescription
+                    }
+                }.value
+                if scoped { source.stopAccessingSecurityScopedResource() }
+                copyingImage = false
+                if let failure {
+                    importError = failure
+                    return
+                }
+                // The writable layer describes the old base image.
+                OverlayDisk.reset()
+                refresh()
+            }
         } catch {
             importError = error.localizedDescription
         }

@@ -417,6 +417,10 @@ enum RootfsImage {
     /// settings store no name: a stored name, `rootfs.erofs` included, is kept.
     static let defaultFilename = "archrium.erofs"
     static let environmentKey = "KERNARIUM_ROOTFS"
+    /// The persistent writable layer the Linux guest boots on. It lives in
+    /// Documents beside the images, so it must never be offered as one.
+    static let overlayFilename = "kernarium-overlay.ext4"
+    static let overlayOwnerFilename = "kernarium-overlay.owner"
 
     /// The image the application ships in its own bundle, released into
     /// Documents on first launch so the guest can be started without the
@@ -457,6 +461,7 @@ enum RootfsImage {
         let pathExtension = (filename as NSString).pathExtension.lowercased()
         guard !filename.isEmpty,
               (filename as NSString).lastPathComponent == filename,
+              filename != overlayFilename,
               namesOnKernelCommandLine(filename),
               pathExtension == "erofs" || pathExtension == "ext4" ||
                   pathExtension == GuestBundle.pathExtension

@@ -104,10 +104,17 @@ app)
       done
     fi
     cat .build/rootfs-parts/archrium.erofs.part.* > .build/archrium.erofs
+    # A truncated download or a changed release must not become an IPA that
+    # boots into nothing. The hash is the accepted image's.
+    test "$(wc -c < .build/archrium.erofs | tr -d ' ')" = "2402922496"
+    echo "0c1f84a00f50245d4b33159f0e546d79924d0e09b0472c40983d7d5a7ef4ed23  .build/archrium.erofs" \
+      | shasum -a 256 -c -
     ARCHRIUM_ROOTFS=.build/archrium.erofs
   fi
   if [ -n "${ARCHRIUM_ROOTFS:-}" ]; then
     test -f "$ARCHRIUM_ROOTFS"
+    rm -rf Payload Archrium-unsigned.ipa
+    mkdir -p Payload
     cp "$ARCHRIUM_ROOTFS" "$APP/archrium.erofs"
   fi
   mkdir -p Payload

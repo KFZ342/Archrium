@@ -519,15 +519,24 @@ struct GuestRunEnd: Equatable {
 /// switch between them.
 private struct GuestEndedNotice: View {
     let end: GuestRunEnd
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        GuestNoticeCard(
-            systemName: end.systemName,
-            title: end.title,
-            message: end.message
-        )
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("guestEndedNotice")
+        VStack(spacing: 14) {
+            GuestNoticeCard(
+                systemName: end.systemName,
+                title: end.title,
+                message: end.message
+            )
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("guestEndedNotice")
+
+            // Without this the guest's screen cannot be left short of
+            // force-quitting the app.
+            Button("Back to home") { dismiss() }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("guestEndedBackButton")
+        }
     }
 }
 
@@ -782,7 +791,7 @@ enum GuestSpecialKey: UInt16, CaseIterable, Identifiable {
 }
 
 enum OverlayDisk {
-    static let filename = "kernarium-overlay.ext4"
+    static let filename = RootfsImage.overlayFilename
 
     static func byteCount(forSizeGiB sizeGiB: Int) throws -> UInt64 {
         guard EmulatorConfiguration.overlaySizeRangeGiB.contains(sizeGiB) else {
@@ -791,14 +800,74 @@ enum OverlayDisk {
         return UInt64(sizeGiB) * 1024 * 1024 * 1024
     }
 
+    /// The image is the overlay's lower layer: an overlay left from a
+    /// different image must not be mounted over this one. A short fingerprint
+    /// tells the bundled image from a replacement without hashing gigabytes
+    /// on every launch.
+    private static func ownerValue(for rootfs: URL?) -> String? {
+        guard let rootfs,
+              let attributes = try? FileManager.default.attributesOfItem(
+                  atPath: rootfs.path
+              ),
+              let size = attributes[.size] as? NSNumber
+        else { return nil }
+        // The first block of an EROFS carries its superblock, including the
+        // volume UUID. Hashing it separates two images that happen to have the
+        // same byte count without reading gigabytes at every launch.
+        var prefix = "unreadable"
+        if let handle = try? FileHandle(forReadingFrom: rootfs),
+           let data = try? handle.read(upToCount: 4096),
+           !data.isEmpty {
+            var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+            for byte in data {
+                hash = (hash ^ UInt64(byte)) &* 0x0000_0100_0000_01b3
+            }
+            prefix = String(hash, radix: 16)
+            try? handle.close()
+        }
+        return "\(rootfs.lastPathComponent):\(size.uint64Value):\(prefix)"
+    }
+
+    private static func excludeFromBackup(_ url: URL) {
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutable = url
+        try? mutable.setResourceValues(values)
+    }
+
+    /// The persistent writable layer, sized for `sizeGiB`. An existing layer
+    /// is grown, never discarded, unless it belongs to a different rootfs.
     static func prepare(
         sizeGiB: Int,
-        in directory: URL = RootfsImage.documentsDirectory
+        in directory: URL = RootfsImage.documentsDirectory,
+        rootfs: URL? = nil
     ) throws -> URL {
         let manager = FileManager.default
         let disk = directory.appendingPathComponent(filename)
+        let ownerURL = directory.appendingPathComponent(
+            RootfsImage.overlayOwnerFilename
+        )
         let requestedByteCount = try byteCount(forSizeGiB: sizeGiB)
-        if manager.fileExists(atPath: disk.path) {
+        let owner = ownerValue(for: rootfs)
+
+        var createLayer = !manager.fileExists(atPath: disk.path)
+        if !createLayer,
+           let owner,
+           let stored = try? String(contentsOf: ownerURL, encoding: .utf8),
+           stored != owner {
+            // The guest changed its base image. Files and whiteouts in this
+            // layer describe the old one; remove it before mounting it over
+            // the new image. The removal is what makes the next create safe.
+            do {
+                try manager.removeItem(at: disk)
+                try? manager.removeItem(at: ownerURL)
+                createLayer = true
+            } catch {
+                throw error
+            }
+        }
+
+        if !createLayer {
             let attributes = try manager.attributesOfItem(atPath: disk.path)
             let current = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
             if current < requestedByteCount {
@@ -806,8 +875,13 @@ enum OverlayDisk {
                 defer { try? handle.close() }
                 try handle.truncate(atOffset: requestedByteCount)
             }
+            excludeFromBackup(disk)
+            if let owner {
+                try? owner.write(to: ownerURL, atomically: true, encoding: .utf8)
+            }
             return disk
         }
+
         guard manager.createFile(atPath: disk.path, contents: nil) else {
             throw CocoaError(.fileWriteUnknown)
         }
@@ -819,11 +893,25 @@ enum OverlayDisk {
             try? manager.removeItem(at: disk)
             throw error
         }
-        var values = URLResourceValues()
-        values.isExcludedFromBackup = true
-        var mutable = disk
-        try? mutable.setResourceValues(values)
+        excludeFromBackup(disk)
+        if let owner {
+            try? owner.write(to: ownerURL, atomically: true, encoding: .utf8)
+        }
         return disk
+    }
+
+    /// Drop the writable layer and what it belongs to. The caller has just
+    /// replaced the image it was mounted over.
+    static func reset(in directory: URL = RootfsImage.documentsDirectory) {
+        let manager = FileManager.default
+        try? manager.removeItem(
+            at: directory.appendingPathComponent(filename)
+        )
+        try? manager.removeItem(
+            at: directory.appendingPathComponent(
+                RootfsImage.overlayOwnerFilename
+            )
+        )
     }
 }
 
@@ -1240,7 +1328,8 @@ final class EmulatorLauncher: ObservableObject, SpaceRun {
         }
         do {
             let overlay = try OverlayDisk.prepare(
-                sizeGiB: configuration.overlaySizeGiB
+                sizeGiB: configuration.overlaySizeGiB,
+                rootfs: rootfs
             )
             return PreparedBoot(rootfs: rootfs, overlay: overlay)
         } catch {

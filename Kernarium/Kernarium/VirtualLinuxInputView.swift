@@ -317,7 +317,9 @@ private struct TrackpadSurface: UIViewRepresentable {
             let translation = gesture.translation(in: view)
             switch gesture.state {
             case .began:
-                last = .zero
+                // UIKit begins a pan after a few points, so zeroing here
+                // would replay that distance as a jump on the first change.
+                last = gesture.translation(in: view)
             case .changed:
                 let dx = translation.x - last.x
                 let dy = translation.y - last.y
@@ -373,18 +375,23 @@ private enum VirtualKeySender {
 
     static func text(_ character: Character, modifiers: [VirtualModifier], shifted: Bool) {
         let codes = modifiers.map(code(for:))
+        let stroke = LinuxKeyboard.stroke(for: character)
+        // A shifted character such as "!" or "A" needs Shift even when the
+        // person did not tap the sticky Shift key. Without it the guest sees
+        // the unshifted key ("1" or "a").
+        let needsShift = shifted || (stroke?.shifted ?? false)
         for modifier in codes { send(modifier, true) }
-        if shifted && !character.isUppercase {
+        if needsShift {
             send(LinuxKeyboard.leftShift, true)
         }
-        if let stroke = LinuxKeyboard.stroke(for: character) {
+        if let stroke {
             send(stroke.code, true)
             send(stroke.code, false)
         } else if let ascii = character.asciiValue {
             send(UInt16(ascii), true)
             send(UInt16(ascii), false)
         }
-        if shifted && !character.isUppercase {
+        if needsShift {
             send(LinuxKeyboard.leftShift, false)
         }
         for modifier in codes.reversed() { send(modifier, false) }
