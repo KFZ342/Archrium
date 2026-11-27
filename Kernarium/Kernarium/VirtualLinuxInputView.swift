@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 import SwiftUI
+import UIKit
 
 /// Keys the virtual keyboard sends. Character keys go through the same
 /// evdev map as the system keyboard, so a letter typed here is the same
@@ -103,6 +104,7 @@ struct VirtualLinuxInputView: View {
 
     private var keyboard: some View {
         VStack(spacing: 4) {
+            shortcutRow
             row([.escape, .tab, .control, .option, .command, .left, .up, .down, .right])
             if symbols {
                 row(characters("!@#$%^&*()"))
@@ -136,41 +138,16 @@ struct VirtualLinuxInputView: View {
 
     private var trackpad: some View {
         VStack(spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color.black.opacity(0.28))
-                Text("Drag to move · Tap to click")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Color.clear
-                    .contentShape(Rectangle())
-                    .gesture(
-                        DragGesture(minimumDistance: 0)
-                            .onChanged { value in
-                                if !dragging {
-                                    dragging = true
-                                    lastTranslation = .zero
-                                }
-                                let dx = value.translation.width - lastTranslation.width
-                                let dy = value.translation.height - lastTranslation.height
-                                lastTranslation = value.translation
-                                if abs(dx) >= 0.5 || abs(dy) >= 0.5 {
-                                    VirtualKeySender.mouse(
-                                        dx: Int32(dx * 1.6), dy: Int32(dy * 1.6),
-                                        buttons: 0, wheel: 0
-                                    )
-                                }
-                            }
-                            .onEnded { value in
-                                let moved = abs(value.translation.width) + abs(value.translation.height)
-                                if moved < 8 {
-                                    VirtualKeySender.click(.primary)
-                                }
-                                dragging = false
-                            }
-                    )
-            }
-            .frame(height: 150)
+            TrackpadSurface()
+                .frame(height: 150)
+                .background(Color.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 12))
+                .overlay(alignment: .topLeading) {
+                    Text("Drag to move · 1-finger tap left · 2-finger tap right · 3-finger tap middle")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(8)
+                        .allowsHitTesting(false)
+                }
 
             HStack(spacing: 6) {
                 trackpadButton("Left", .primary)
@@ -181,6 +158,43 @@ struct VirtualLinuxInputView: View {
                 Button("Scroll ↓") { VirtualKeySender.wheel(-120) }
                     .buttonStyle(.bordered)
             }
+        }
+    }
+
+    private var shortcutRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                shortcut("Copy", "c", [.control])
+                shortcut("Paste", "v", [.control])
+                shortcut("Cut", "x", [.control])
+                shortcut("Undo", "z", [.control])
+                shortcut("Term", "t", [.control, .option])
+                shortcut("Alt-Tab", "\t", [.option])
+                Button("Super") {
+                    VirtualKeySender.tap(LinuxKeyboard.leftSuper, modifiers: [])
+                }
+                .buttonStyle(.bordered)
+                .font(.caption)
+                Button("Paste host") { pasteHostClipboard() }
+                    .buttonStyle(.bordered)
+                    .font(.caption)
+            }
+        }
+        .frame(height: 32)
+    }
+
+    private func shortcut(_ title: String, _ character: Character, _ modifiers: [VirtualModifier]) -> some View {
+        Button(title) {
+            VirtualKeySender.text(character, modifiers: modifiers, shifted: false)
+        }
+        .buttonStyle(.bordered)
+        .font(.caption)
+    }
+
+    private func pasteHostClipboard() {
+        guard let string = UIPasteboard.general.string, !string.isEmpty else { return }
+        for character in string.prefix(20_000) {
+            VirtualKeySender.text(character, modifiers: [], shifted: false)
         }
     }
 
@@ -260,6 +274,79 @@ struct VirtualLinuxInputView: View {
             sticky.remove(modifier)
         } else {
             sticky.insert(modifier)
+        }
+    }
+}
+
+private struct TrackpadSurface: UIViewRepresentable {
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        view.isMultipleTouchEnabled = true
+
+        let pan = UIPanGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handlePan(_:))
+        )
+        pan.minimumNumberOfTouches = 1
+        pan.maximumNumberOfTouches = 3
+        view.addGestureRecognizer(pan)
+
+        for (touches, action) in [
+            (1, #selector(Coordinator.primaryTap(_:))),
+            (2, #selector(Coordinator.secondaryTap(_:))),
+            (3, #selector(Coordinator.middleTap(_:)))
+        ] {
+            let tap = UITapGestureRecognizer(target: context.coordinator, action: action)
+            tap.numberOfTouchesRequired = touches
+            tap.require(toFail: pan)
+            view.addGestureRecognizer(tap)
+        }
+        return view
+    }
+
+    func updateUIView(_ view: UIView, context: Context) {}
+
+    final class Coordinator: NSObject {
+        private var last: CGPoint = .zero
+
+        @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
+            guard let view = gesture.view else { return }
+            let translation = gesture.translation(in: view)
+            switch gesture.state {
+            case .began:
+                last = .zero
+            case .changed:
+                let dx = translation.x - last.x
+                let dy = translation.y - last.y
+                last = translation
+                if gesture.numberOfTouches >= 2 {
+                    _ = kernarium_runtime_loader_send_mouse(
+                        0, 0, 0,
+                        Int32(-dy * 1.5), Int32(dx * 1.5)
+                    )
+                } else if abs(dx) >= 0.5 || abs(dy) >= 0.5 {
+                    _ = kernarium_runtime_loader_send_mouse(
+                        Int32(dx * 1.6), Int32(dy * 1.6), 0, 0, 0
+                    )
+                }
+            default:
+                last = .zero
+            }
+        }
+
+        @objc func primaryTap(_ gesture: UITapGestureRecognizer) {
+            VirtualKeySender.click(.primary)
+        }
+
+        @objc func secondaryTap(_ gesture: UITapGestureRecognizer) {
+            VirtualKeySender.click(.secondary)
+        }
+
+        @objc func middleTap(_ gesture: UITapGestureRecognizer) {
+            VirtualKeySender.click(.middle)
         }
     }
 }
