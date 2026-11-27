@@ -6,7 +6,7 @@ stage=$1
 
 case "$stage" in
 deps)
-  brew install meson ninja gperf bison flex pkg-config autoconf automake libtool nasm
+  brew install meson ninja gperf bison flex pkg-config autoconf automake libtool nasm groff
   dependencies/prepare.sh --product macos
   dependencies/build.sh
   dependencies/prepare.sh --product apple-gpu-vulkan-experiment
