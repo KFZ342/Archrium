@@ -1,0 +1,61 @@
+name: Build Archrium IPA
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: archrium-ipa
+  cancel-in-progress: true
+
+jobs:
+  dependencies:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dependencies
+        run: scripts/ci/build-ipa.sh deps
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archrium-dependencies
+          path: .build/dependencies
+          if-no-files-found: error
+          retention-days: 7
+
+  runtime:
+    needs: dependencies
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: archrium-dependencies
+          path: .build/dependencies
+      - name: Build frameworks
+        run: scripts/ci/build-ipa.sh runtime
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archrium-frameworks
+          path: .build/kernarium-xcframeworks
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: runtime
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: archrium-frameworks
+          path: .build/kernarium-xcframeworks
+      - name: Build app and IPA
+        run: scripts/ci/build-ipa.sh app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Archrium-unsigned-ipa
+          path: Archrium-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
