@@ -59,8 +59,10 @@ constexpr std::int64_t resizeSettleNanoseconds =
 [[nodiscard]] CADisplayLink* makeDisplayLink(
     UIWindowScene* scene, id target, SEL selector) noexcept
 {
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
     if (@available(iOS 27.0, *))
         return [scene displayLinkWithTarget:target selector:selector];
+#endif
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return [scene.screen displayLinkWithTarget:target selector:selector];
