@@ -418,6 +418,41 @@ enum RootfsImage {
     static let defaultFilename = "archrium.erofs"
     static let environmentKey = "KERNARIUM_ROOTFS"
 
+    /// The image the application ships in its own bundle, released into
+    /// Documents on first launch so the guest can be started without the
+    /// user moving a multi-gigabyte file by hand.
+    static var bundledImageURL: URL? {
+        Bundle.main.url(forResource: "archrium", withExtension: "erofs")
+    }
+
+    static var needsBundledImage: Bool {
+        guard let bundledImageURL else { return false }
+        return !FileManager.default.fileExists(
+            atPath: documentsDirectory
+                .appendingPathComponent(defaultFilename).path
+        )
+            && FileManager.default.fileExists(atPath: bundledImageURL.path)
+    }
+
+    /// Copies the bundled image beside the guest disks, through a temporary
+    /// name so an interrupted first launch never leaves a short image that
+    /// the settings would offer as bootable.
+    static func installBundledImageIfNeeded() throws {
+        guard needsBundledImage, let bundledImageURL else { return }
+        let fileManager = FileManager.default
+        let destination = documentsDirectory
+            .appendingPathComponent(defaultFilename)
+        let temporary = documentsDirectory
+            .appendingPathComponent(".archrium.erofs.partial")
+        try? fileManager.removeItem(at: temporary)
+        try fileManager.copyItem(at: bundledImageURL, to: temporary)
+        try fileManager.moveItem(at: temporary, to: destination)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutable = destination
+        try? mutable.setResourceValues(values)
+    }
+
     nonisolated static var documentsDirectory: URL {
         FileManager.default.urls(
             for: .documentDirectory,

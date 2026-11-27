@@ -40,7 +40,18 @@ jobs:
         with:
           name: archrium-frameworks
           path: .build/kernarium-xcframeworks
+      - name: Download bundled Linux image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .build/rootfs-parts
+          gh release download rootfs-v1 -R "$GITHUB_REPOSITORY" -p 'archrium.erofs.part.*' -D .build/rootfs-parts
+          cat .build/rootfs-parts/archrium.erofs.part.* > .build/archrium.erofs
+          LS=\$(wc -c < .build/archrium.erofs | tr -d ' ')
+          echo "bundled rootfs bytes: \$LS"
       - name: Build app and IPA
+        env:
+          ARCHRIUM_ROOTFS: .build/archrium.erofs
         run: scripts/ci/build-ipa.sh app
       - uses: actions/upload-artifact@v4
         with:

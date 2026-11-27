@@ -31,7 +31,7 @@ struct KernariumApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ArchriumHomeView()
         }
     }
 }

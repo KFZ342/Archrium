@@ -82,6 +82,10 @@ app)
     build
   APP=$(find .build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
   test -n "$APP"
+  if [ -n "${ARCHRIUM_ROOTFS:-}" ]; then
+    test -f "$ARCHRIUM_ROOTFS"
+    cp "$ARCHRIUM_ROOTFS" "$APP/archrium.erofs"
+  fi
   mkdir -p Payload
   cp -R "$APP" Payload/
   zip -qry Archrium-unsigned.ipa Payload

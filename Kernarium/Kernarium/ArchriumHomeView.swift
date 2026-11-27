@@ -12,6 +12,7 @@ struct ArchriumHomeView: View {
     @State private var importError: String?
     @State private var images: [String] = []
     @State private var settingsPresented = false
+    @State private var preparingImage = false
 
     private var selectedImage: String? { images.first }
 
@@ -55,6 +56,17 @@ struct ArchriumHomeView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(importError ?? "")
+            }
+            .overlay {
+                if preparingImage {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("Preparing the bundled Linux image…")
+                            .font(.callout)
+                    }
+                    .padding(20)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
             }
             .onAppear(perform: refresh)
         }
@@ -157,6 +169,16 @@ struct ArchriumHomeView: View {
 
     private func refresh() {
         images = RootfsImage.availableFilenames()
+        guard selectedImage == nil, RootfsImage.needsBundledImage,
+              !preparingImage else { return }
+        preparingImage = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            try? RootfsImage.installBundledImageIfNeeded()
+            DispatchQueue.main.async {
+                preparingImage = false
+                images = RootfsImage.availableFilenames()
+            }
+        }
     }
 
     private func importImage(_ result: Result<[URL], Error>) {
