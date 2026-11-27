@@ -20,6 +20,7 @@ struct ContentView: View {
     /// Whether the framebuffer holds the keyboard. Only the framebuffer
     /// mode sets it; the serial console's keyboard is its terminal's focus.
     @State private var framebufferKeyboardVisible = false
+    @State private var virtualInputVisible = false
     @State private var specialKeysExpanded = false
     @State private var settingsPresented = false
     /// Whether the window scene fills the screen. Until the view is in a
@@ -141,6 +142,13 @@ struct ContentView: View {
         .overlay {
             if RootfsImage.availableFilenames().isEmpty {
                 ArchriumWelcomeView()
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if virtualInputVisible, guestViewMode == .framebuffer,
+               launcher.phase == .running {
+                VirtualLinuxInputView(isPresented: $virtualInputVisible)
+                    .transition(.move(edge: .bottom))
             }
         }
         .onAppear {
@@ -323,7 +331,7 @@ struct ContentView: View {
     /// Whether the view on screen holds the keyboard.
     private var keyboardVisible: Bool {
         switch guestViewMode {
-        case .framebuffer: framebufferKeyboardVisible
+        case .framebuffer: virtualInputVisible
         case .serialConsole: serialConsole.isFocused
         }
     }
@@ -406,7 +414,10 @@ struct ContentView: View {
     private func toggleKeyboard() {
         switch guestViewMode {
         case .framebuffer:
-            framebufferKeyboardVisible.toggle()
+            virtualInputVisible.toggle()
+            if virtualInputVisible {
+                framebufferKeyboardVisible = false
+            }
         case .serialConsole:
             if serialConsole.isFocused {
                 serialConsole.resignFirstResponder()
