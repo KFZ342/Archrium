@@ -275,6 +275,7 @@ struct Output final {
                          error:error];
     }
 #endif
+    (void)error;
     [engine connect:player to:engine.mainMixerNode format:format];
     return true;
 }
@@ -285,6 +286,7 @@ struct Output final {
     if (@available(iOS 27.0, *))
         return [player playAndReturnError:error];
 #endif
+    (void)error;
     // `play` reports nothing, and it returns with the player stopped when its
     // engine stopped between the engine's start and this call, as a change of
     // the format or the route does. What counts is that the player plays.
@@ -452,7 +454,9 @@ public:
                                   context.recommendation ==
                                   AVAudioSessionResumptionRecommendationShouldResume});
                         }];
-        } else {
+        } else
+#endif
+        {
             /* Before iOS 27 the system posts one notification, for an
              * interruption's beginning and its end. The sink resumes on every
              * end it reports, and takes the session back at once only on the
